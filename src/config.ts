@@ -53,12 +53,12 @@ export const CHAIN_CONFIGS: Record<SupportedChain, ChainConfig> = {
     name: 'Ethereum Mainnet',
     rpcEnvKey: 'ETH_RPC_URL',
     
-    // cc0strategy contracts (DEPLOYED 2026-02-24)
+    // cc0strategy contracts (REDEPLOYED 2026-02-24 v2 - fully configured)
     // 
-    factory: '0x45e1D9bb68E514565710DEaf2567B73EF86638e0',
-    hook: '0x9f4A65977FbE6ACb9Eee50cEf8319c397C8628cC',
-    feeDistributor: '0xDe6DBe5957B617fda4b2dcA4dd45a32B87a54BfE',
-    lpLocker: '0xF07807dD09830fea3Cef171054E28519Be0113BA',
+    factory: '0xBbeBcC4aa7DDb4BeA65C86A2eB4147A6f39F10d3',
+    hook: '0x9bEbE14d85375634c723EB5DC7B7E07C835dE8CC',
+    feeDistributor: '0xF8bFB6aED4A5Bd1c7E4ADa231c0EdDeB49618989',
+    lpLocker: '0xb43aaEe744c46822C7f9209ECD5468C97B937030',
     treasury: '0x58e510f849e38095375a3e478ad1d719650b8557', // Same as Base
     
     // Uniswap V4 contracts (ready for deployment)
