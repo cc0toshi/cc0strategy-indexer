@@ -306,6 +306,28 @@ app.get('/tokens/:address', async (c) => {
   }
 });
 
+// DELETE /tokens/:address - Delete a token (admin only)
+app.delete('/tokens/:address', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  try {
+    const address = c.req.param('address').toLowerCase();
+    const result = await sql`DELETE FROM tokens WHERE address = ${address} RETURNING *`;
+    
+    if (!result[0]) {
+      return c.json({ error: 'Token not found' }, 404);
+    }
+    
+    console.log(`Deleted token: ${result[0].symbol} (${address})`);
+    return c.json({ success: true, deleted: result[0] });
+  } catch (e: any) {
+    console.error('Error deleting token:', e.message);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 // POST /tokens - Register new token
 app.post('/tokens', async (c) => {
   if (!sql) {
