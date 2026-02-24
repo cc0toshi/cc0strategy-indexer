@@ -459,6 +459,65 @@ app.get('/contracts', async (c) => {
   }
 });
 
+// GET /migrate - Run schema migrations (one-time fix)
+app.get('/migrate', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  const results: string[] = [];
+  
+  try {
+    // Add decimals column if not exists
+    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS decimals INTEGER NOT NULL DEFAULT 18`;
+    results.push('✅ Added decimals column');
+  } catch (e: any) {
+    results.push(`⚠️ decimals: ${e.message}`);
+  }
+  
+  try {
+    // Add chain column if not exists
+    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS chain VARCHAR(20) NOT NULL DEFAULT 'base'`;
+    results.push('✅ Added chain column');
+  } catch (e: any) {
+    results.push(`⚠️ chain: ${e.message}`);
+  }
+  
+  try {
+    // Create chain index if not exists
+    await sql`CREATE INDEX IF NOT EXISTS idx_tokens_chain ON tokens(chain)`;
+    results.push('✅ Created chain index');
+  } catch (e: any) {
+    results.push(`⚠️ chain index: ${e.message}`);
+  }
+  
+  try {
+    // Add nft_collection_name if not exists
+    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS nft_collection_name VARCHAR(255)`;
+    results.push('✅ Added nft_collection_name column');
+  } catch (e: any) {
+    results.push(`⚠️ nft_collection_name: ${e.message}`);
+  }
+  
+  try {
+    // Update pool_id for MFERSTR if it exists without one
+    await sql`
+      UPDATE tokens 
+      SET pool_id = decode('458172bf46475e851b0e78f83d721c6bec86ad74a99caa1e3634fa5bb88a77ad', 'hex')
+      WHERE address = '0x0860d4f54de8d47982a4530b496f71b4cb85b9ac' 
+      AND (pool_id IS NULL OR pool_id = '')
+    `;
+    results.push('✅ Updated MFERSTR pool_id');
+  } catch (e: any) {
+    results.push(`⚠️ MFERSTR pool_id: ${e.message}`);
+  }
+  
+  return c.json({ 
+    status: 'migration complete',
+    results 
+  });
+});
+
 // ============================================
 // START SERVER
 // ============================================
