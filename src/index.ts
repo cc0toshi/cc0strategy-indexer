@@ -1,20 +1,110 @@
-// Main entry point - simplified for Railway
+// Main entry point - Multi-chain cc0strategy indexer
 import 'dotenv/config';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
 import postgres from 'postgres';
+import { 
+  CHAIN_CONFIGS, 
+  SupportedChain, 
+  getChainConfig, 
+  getRpcUrl, 
+  isChainActive,
+  getActiveChains,
+  validateChain 
+} from './config.js';
 
 // ============================================
 // CONFIGURATION
 // ============================================
 const PORT = parseInt(process.env.PORT || '3000');
 const DATABASE_URL = process.env.DATABASE_URL || '';
-const FACTORY_ADDRESS = '0x70b17db500Ce1746BB34f908140d0279C183f3eb';
 
-console.log('🚀 cc0strategy Indexer Starting...');
+console.log('🚀 cc0strategy Multi-Chain Indexer Starting...');
 console.log(`🌐 Port: ${PORT}`);
 console.log(`📦 Database: ${DATABASE_URL ? 'configured' : 'NOT SET'}`);
+
+// ============================================
+// MULTI-CHAIN RPC CLIENTS
+// ============================================
+interface RpcStatus {
+  url: string | null;
+  connected: boolean;
+  blockNumber: number | null;
+  lastChecked: Date | null;
+  error: string | null;
+}
+
+const rpcStatus: Record<SupportedChain, RpcStatus> = {
+  base: { url: null, connected: false, blockNumber: null, lastChecked: null, error: null },
+  ethereum: { url: null, connected: false, blockNumber: null, lastChecked: null, error: null },
+};
+
+// Initialize RPC URLs from environment
+function initRpcClients() {
+  for (const chain of Object.keys(CHAIN_CONFIGS) as SupportedChain[]) {
+    const rpcUrl = getRpcUrl(chain);
+    if (rpcUrl) {
+      rpcStatus[chain].url = rpcUrl;
+      console.log(`✅ ${CHAIN_CONFIGS[chain].name} RPC configured`);
+    } else {
+      console.log(`⚠️ ${CHAIN_CONFIGS[chain].name} RPC not configured (${CHAIN_CONFIGS[chain].rpcEnvKey})`);
+    }
+  }
+}
+
+// Check RPC connection health
+async function checkRpcHealth(chain: SupportedChain): Promise<void> {
+  const status = rpcStatus[chain];
+  if (!status.url) {
+    status.connected = false;
+    status.error = 'RPC URL not configured';
+    return;
+  }
+
+  try {
+    const response = await fetch(status.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'eth_blockNumber',
+        params: [],
+        id: 1,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+
+    const data = await response.json() as { result?: string; error?: { message: string } };
+    
+    if (data.error) {
+      throw new Error(data.error.message);
+    }
+
+    status.connected = true;
+    status.blockNumber = parseInt(data.result || '0', 16);
+    status.lastChecked = new Date();
+    status.error = null;
+  } catch (e: any) {
+    status.connected = false;
+    status.blockNumber = null;
+    status.lastChecked = new Date();
+    status.error = e.message;
+  }
+}
+
+// Check all RPCs
+async function checkAllRpcHealth(): Promise<void> {
+  await Promise.all(
+    (Object.keys(rpcStatus) as SupportedChain[]).map(checkRpcHealth)
+  );
+}
+
+// Initialize RPC clients
+initRpcClients();
 
 // ============================================
 // DATABASE
@@ -35,27 +125,113 @@ if (DATABASE_URL) {
 }
 
 // ============================================
+// EVENT INDEXING STRUCTURE (Future)
+// ============================================
+/**
+ * Event indexing will listen for:
+ * 
+ * Factory Events:
+ * - TokenDeployed(address indexed token, address indexed nftCollection, address deployer)
+ *   → Auto-register new tokens in database
+ * 
+ * FeeDistributor Events:
+ * - FeesReceived(address indexed token, uint256 amount)
+ *   → Track total fees collected per token
+ * - FeesClaimed(address indexed token, address indexed claimer, uint256[] tokenIds, uint256 amount)
+ *   → Track claims history
+ * 
+ * Implementation approach:
+ * 1. Use viem for event subscription
+ * 2. Store last indexed block per chain in database
+ * 3. On startup, backfill from last indexed to current
+ * 4. Then subscribe to new events
+ */
+
+interface EventIndexerConfig {
+  chain: SupportedChain;
+  contractAddress: string;
+  eventName: string;
+  fromBlock: bigint;
+}
+
+// Placeholder for future event indexing
+async function startEventIndexer(_config: EventIndexerConfig): Promise<void> {
+  // TODO: Implement when ready
+  console.log(`📡 Event indexing placeholder for ${_config.chain}:${_config.eventName}`);
+}
+
+// ============================================
 // API SERVER
 // ============================================
 const app = new Hono();
 
 app.use('*', cors());
 
-// Health check
-app.get('/', (c) => c.json({ 
-  status: 'ok', 
-  service: 'cc0strategy-indexer', 
-  factory: FACTORY_ADDRESS,
-  database: sql ? 'connected' : 'not connected',
-  timestamp: new Date().toISOString()
-}));
+// Health check with multi-chain RPC status
+app.get('/', async (c) => {
+  // Check RPC health on each request (with caching via lastChecked)
+  const now = Date.now();
+  for (const chain of Object.keys(rpcStatus) as SupportedChain[]) {
+    const status = rpcStatus[chain];
+    // Only recheck if last check was > 30 seconds ago
+    if (!status.lastChecked || now - status.lastChecked.getTime() > 30000) {
+      await checkRpcHealth(chain);
+    }
+  }
 
-app.get('/health', (c) => c.json({ 
-  status: 'healthy', 
-  timestamp: new Date().toISOString() 
-}));
+  return c.json({ 
+    status: 'ok', 
+    service: 'cc0strategy-indexer',
+    version: '2.0.0',
+    database: sql ? 'connected' : 'not connected',
+    chains: {
+      base: {
+        factory: CHAIN_CONFIGS.base.factory,
+        contractsDeployed: isChainActive('base'),
+        rpc: {
+          configured: !!rpcStatus.base.url,
+          connected: rpcStatus.base.connected,
+          blockNumber: rpcStatus.base.blockNumber,
+          error: rpcStatus.base.error,
+        },
+      },
+      ethereum: {
+        factory: CHAIN_CONFIGS.ethereum.factory,
+        contractsDeployed: isChainActive('ethereum'),
+        rpc: {
+          configured: !!rpcStatus.ethereum.url,
+          connected: rpcStatus.ethereum.connected,
+          blockNumber: rpcStatus.ethereum.blockNumber,
+          error: rpcStatus.ethereum.error,
+        },
+      },
+    },
+    activeChains: getActiveChains(),
+    timestamp: new Date().toISOString()
+  });
+});
 
-// GET /tokens - List all tokens
+app.get('/health', async (c) => {
+  await checkAllRpcHealth();
+  
+  const allRpcsHealthy = Object.values(rpcStatus).every(
+    s => !s.url || s.connected // Either not configured or connected
+  );
+  
+  return c.json({ 
+    status: allRpcsHealthy && sql ? 'healthy' : 'degraded',
+    database: sql ? 'ok' : 'error',
+    rpcs: Object.fromEntries(
+      (Object.keys(rpcStatus) as SupportedChain[]).map(chain => [
+        chain, 
+        rpcStatus[chain].connected ? 'ok' : (rpcStatus[chain].url ? 'error' : 'not_configured')
+      ])
+    ),
+    timestamp: new Date().toISOString() 
+  });
+});
+
+// GET /tokens - List all tokens with optional chain filter
 app.get('/tokens', async (c) => {
   if (!sql) {
     return c.json({ error: 'Database not configured', tokens: [] }, 500);
@@ -64,21 +240,41 @@ app.get('/tokens', async (c) => {
   try {
     const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
     const offset = parseInt(c.req.query('offset') || '0');
+    const chainFilter = c.req.query('chain');
     
-    const tokens = await sql`
-      SELECT * FROM tokens 
-      ORDER BY deployed_at DESC 
-      LIMIT ${limit} OFFSET ${offset}
-    `;
+    // Validate chain if provided
+    if (chainFilter && !validateChain(chainFilter)) {
+      return c.json({ error: 'Invalid chain. Must be "base" or "ethereum"' }, 400);
+    }
     
-    return c.json({ tokens, pagination: { limit, offset } });
+    let tokens;
+    if (chainFilter) {
+      tokens = await sql`
+        SELECT * FROM tokens 
+        WHERE chain = ${chainFilter}
+        ORDER BY deployed_at DESC 
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    } else {
+      tokens = await sql`
+        SELECT * FROM tokens 
+        ORDER BY deployed_at DESC 
+        LIMIT ${limit} OFFSET ${offset}
+      `;
+    }
+    
+    return c.json({ 
+      tokens, 
+      pagination: { limit, offset },
+      filter: chainFilter ? { chain: chainFilter } : null
+    });
   } catch (e: any) {
     console.error('Error fetching tokens:', e.message);
     return c.json({ error: e.message, tokens: [] }, 500);
   }
 });
 
-// GET /tokens/:address - Single token
+// GET /tokens/:address - Single token (includes chain in response)
 app.get('/tokens/:address', async (c) => {
   if (!sql) {
     return c.json({ error: 'Database not configured' }, 500);
@@ -92,7 +288,18 @@ app.get('/tokens/:address', async (c) => {
       return c.json({ error: 'Token not found' }, 404);
     }
     
-    return c.json(result[0]);
+    const token = result[0];
+    const chainConfig = getChainConfig(token.chain);
+    
+    return c.json({
+      ...token,
+      chainInfo: chainConfig ? {
+        chainId: chainConfig.chainId,
+        name: chainConfig.name,
+        factory: chainConfig.factory,
+        feeDistributor: chainConfig.feeDistributor,
+      } : null,
+    });
   } catch (e: any) {
     console.error('Error fetching token:', e.message);
     return c.json({ error: e.message }, 500);
@@ -128,6 +335,11 @@ app.post('/tokens', async (c) => {
       return c.json({ error: 'Missing required fields' }, 400);
     }
     
+    // Validate chain
+    if (!validateChain(chain)) {
+      return c.json({ error: 'Invalid chain. Must be "base" or "ethereum"' }, 400);
+    }
+    
     // Insert token
     const result = await sql`
       INSERT INTO tokens (
@@ -148,7 +360,7 @@ app.post('/tokens', async (c) => {
       RETURNING *
     `;
     
-    console.log(`✅ Token registered: ${symbol} (${address})`);
+    console.log(`✅ Token registered: ${symbol} (${address}) on ${chain}`);
     return c.json(result[0]);
   } catch (e: any) {
     console.error('Error registering token:', e.message);
@@ -156,17 +368,94 @@ app.post('/tokens', async (c) => {
   }
 });
 
-// GET /stats
+// GET /stats - Overall stats with per-chain breakdown
 app.get('/stats', async (c) => {
   if (!sql) {
-    return c.json({ total_tokens: 0 });
+    return c.json({ total_tokens: 0, by_chain: {} });
   }
   
   try {
-    const [stats] = await sql`SELECT COUNT(*) as total_tokens FROM tokens`;
-    return c.json(stats);
+    const [totalStats] = await sql`SELECT COUNT(*) as total_tokens FROM tokens`;
+    const chainStats = await sql`
+      SELECT chain, COUNT(*) as count 
+      FROM tokens 
+      GROUP BY chain
+    `;
+    
+    const byChain: Record<string, number> = {};
+    for (const row of chainStats) {
+      byChain[row.chain] = parseInt(row.count);
+    }
+    
+    return c.json({
+      total_tokens: parseInt(totalStats.total_tokens),
+      by_chain: byChain,
+      active_chains: getActiveChains(),
+    });
   } catch (e: any) {
-    return c.json({ total_tokens: 0, error: e.message });
+    return c.json({ total_tokens: 0, by_chain: {}, error: e.message });
+  }
+});
+
+// GET /config - Return chain configurations (public info only)
+app.get('/config', (c) => {
+  const publicConfig = Object.fromEntries(
+    (Object.keys(CHAIN_CONFIGS) as SupportedChain[]).map(chain => [
+      chain,
+      {
+        chainId: CHAIN_CONFIGS[chain].chainId,
+        name: CHAIN_CONFIGS[chain].name,
+        factory: CHAIN_CONFIGS[chain].factory,
+        feeDistributor: CHAIN_CONFIGS[chain].feeDistributor,
+        lpLocker: CHAIN_CONFIGS[chain].lpLocker,
+        hook: CHAIN_CONFIGS[chain].hook,
+        treasury: CHAIN_CONFIGS[chain].treasury,
+        contractsDeployed: isChainActive(chain),
+      },
+    ])
+  );
+  
+  return c.json({
+    chains: publicConfig,
+    activeChains: getActiveChains(),
+  });
+});
+
+// GET /contracts - Contract addresses by chain from database
+app.get('/contracts', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured', contracts: [] }, 500);
+  }
+  
+  try {
+    const chain = c.req.query('chain') || 'base';
+    
+    // Validate chain
+    if (!validateChain(chain)) {
+      return c.json({ error: 'Invalid chain. Must be "base" or "ethereum"' }, 400);
+    }
+    
+    const contracts = await sql`
+      SELECT chain, contract_name, address, deployed_at, deploy_tx_hash, notes, created_at 
+      FROM contract_addresses 
+      WHERE chain = ${chain}
+      ORDER BY contract_name
+    `;
+    
+    // Also return as object keyed by contract_name for easy lookup
+    const addresses: Record<string, string> = {};
+    for (const contract of contracts) {
+      addresses[contract.contract_name] = contract.address;
+    }
+    
+    return c.json({ 
+      chain, 
+      contracts, 
+      addresses 
+    });
+  } catch (e: any) {
+    console.error('Error fetching contracts:', e.message);
+    return c.json({ error: e.message, contracts: [] }, 500);
   }
 });
 
@@ -175,9 +464,15 @@ app.get('/stats', async (c) => {
 // ============================================
 console.log(`🚀 Starting server on port ${PORT}...`);
 
+// Initial RPC health check
+checkAllRpcHealth().then(() => {
+  console.log('📡 Initial RPC health check complete');
+});
+
 serve({ 
   fetch: app.fetch, 
   port: PORT 
 }, (info) => {
   console.log(`✅ Server listening on http://localhost:${info.port}`);
+  console.log(`📋 Active chains: ${getActiveChains().join(', ') || 'none'}`);
 });

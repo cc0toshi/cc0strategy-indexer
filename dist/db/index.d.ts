@@ -1,0 +1,20 @@
+import postgres from 'postgres';
+import type { Token, Swap, Fee, Claim, IndexerState } from '../types/index.js';
+export declare const sql: postgres.Sql<{}>;
+export declare function insertToken(token: Omit<Token, 'id'>): Promise<postgres.Row>;
+export declare function getTokens(options?: {
+    sortBy?: 'deployed_at' | 'volume_24h' | 'tvl';
+    order?: 'asc' | 'desc';
+    limit?: number;
+    offset?: number;
+}): Promise<postgres.RowList<postgres.Row[]>>;
+export declare function getTokenByAddress(address: string): Promise<postgres.Row>;
+export declare function insertSwap(swap: Omit<Swap, 'id'>): Promise<postgres.Row>;
+export declare function getSwapsForToken(tokenAddress: string, limit?: number): Promise<postgres.RowList<postgres.Row[]>>;
+export declare function insertFee(fee: Omit<Fee, 'id'>): Promise<postgres.Row>;
+export declare function insertClaim(claim: Omit<Claim, 'id'>): Promise<postgres.Row>;
+export declare function getOHLCV(tokenAddress: string, interval: string, limit?: number): Promise<postgres.RowList<postgres.Row[]>>;
+export declare function getIndexerState(id: string): Promise<IndexerState | null>;
+export declare function updateIndexerState(id: string, lastBlock: bigint): Promise<void>;
+export declare function updateTokenStats(tokenAddress: string): Promise<void>;
+export default sql;

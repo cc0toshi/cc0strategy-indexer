@@ -81,17 +81,17 @@ async function handleTokenDeployed(log: Log) {
       symbol: metadata.symbol,
       decimals: metadata.decimals,
       nftCollection: nftCollection.toLowerCase(),
-      nftCollectionName: null,
-      poolAddress: null,
+      nftCollectionName: undefined,
+      poolAddress: undefined,
       poolId: poolId,
       deployer: deployer.toLowerCase(),
       deployedAt: new Date(Number(block.timestamp) * 1000),
       deployTxHash: log.transactionHash!,
       deployBlock: log.blockNumber!,
-      description: null,
-      imageUrl: null,
-      websiteUrl: null,
-      twitterUrl: null,
+      description: undefined,
+      imageUrl: undefined,
+      websiteUrl: undefined,
+      twitterUrl: undefined,
     });
     
     console.log(`✅ Token inserted: ${metadata.symbol} (${token})`);
