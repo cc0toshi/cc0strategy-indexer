@@ -467,49 +467,67 @@ app.get('/migrate', async (c) => {
   
   const results: string[] = [];
   
-  try {
-    // Add decimals column if not exists
-    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS decimals INTEGER NOT NULL DEFAULT 18`;
-    results.push('✅ Added decimals column');
-  } catch (e: any) {
-    results.push(`⚠️ decimals: ${e.message}`);
+  // All columns that should exist
+  const columns = [
+    { name: 'decimals', type: 'INTEGER NOT NULL DEFAULT 18' },
+    { name: 'chain', type: "VARCHAR(20) NOT NULL DEFAULT 'base'" },
+    { name: 'nft_collection_name', type: 'VARCHAR(255)' },
+    { name: 'deploy_tx_hash', type: 'VARCHAR(66)' },
+    { name: 'deploy_block', type: 'BIGINT DEFAULT 0' },
+    { name: 'deployed_at', type: 'TIMESTAMP WITH TIME ZONE DEFAULT NOW()' },
+    { name: 'image_url', type: 'TEXT' },
+    { name: 'description', type: 'TEXT' },
+    { name: 'pool_id', type: 'BYTEA' },
+    { name: 'pool_address', type: 'VARCHAR(42)' },
+    { name: 'website_url', type: 'TEXT' },
+    { name: 'twitter_url', type: 'TEXT' },
+    { name: 'created_at', type: 'TIMESTAMP WITH TIME ZONE DEFAULT NOW()' },
+    { name: 'updated_at', type: 'TIMESTAMP WITH TIME ZONE DEFAULT NOW()' },
+  ];
+  
+  for (const col of columns) {
+    try {
+      await sql.unsafe(`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS ${col.name} ${col.type}`);
+      results.push(`✅ ${col.name}`);
+    } catch (e: any) {
+      results.push(`⚠️ ${col.name}: ${e.message}`);
+    }
   }
   
   try {
-    // Add chain column if not exists
-    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS chain VARCHAR(20) NOT NULL DEFAULT 'base'`;
-    results.push('✅ Added chain column');
-  } catch (e: any) {
-    results.push(`⚠️ chain: ${e.message}`);
-  }
-  
-  try {
-    // Create chain index if not exists
     await sql`CREATE INDEX IF NOT EXISTS idx_tokens_chain ON tokens(chain)`;
-    results.push('✅ Created chain index');
+    results.push('✅ chain index');
   } catch (e: any) {
     results.push(`⚠️ chain index: ${e.message}`);
   }
   
+  // Insert MFERSTR if not exists
   try {
-    // Add nft_collection_name if not exists
-    await sql`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS nft_collection_name VARCHAR(255)`;
-    results.push('✅ Added nft_collection_name column');
-  } catch (e: any) {
-    results.push(`⚠️ nft_collection_name: ${e.message}`);
-  }
-  
-  try {
-    // Update pool_id for MFERSTR if it exists without one
     await sql`
-      UPDATE tokens 
-      SET pool_id = decode('458172bf46475e851b0e78f83d721c6bec86ad74a99caa1e3634fa5bb88a77ad', 'hex')
-      WHERE address = '0x0860d4f54de8d47982a4530b496f71b4cb85b9ac' 
-      AND (pool_id IS NULL OR pool_id = '')
+      INSERT INTO tokens (address, name, symbol, decimals, nft_collection, nft_collection_name, deployer, deploy_tx_hash, deploy_block, deployed_at, description, image_url, pool_id, chain)
+      VALUES (
+        '0x0860d4f54de8d47982a4530b496f71b4cb85b9ac',
+        'mferStrategy',
+        'MFERSTR',
+        18,
+        '0x79fcdef22feed20eddacbb2587640e45491b757f',
+        'mfers',
+        '0x9fc58fdfe6b2c8ec6688ae74bda0a3a269ef1201',
+        '0xf7ef37ffd0d0360d11fa1aac85e5082ee5e07c641f5fff83f3458ea0aae77f4f',
+        24460202,
+        '2026-02-24T09:00:00Z',
+        'First token on cc0strategy for mfers holders. 80% of trading fees go to mfers NFT holders.',
+        'ipfs://QmWiQE65tmpYzcokCheQmng2DCM33DEhjXcPB6PanwpAZo',
+        decode('458172bf46475e851b0e78f83d721c6bec86ad74a99caa1e3634fa5bb88a77ad', 'hex'),
+        'ethereum'
+      )
+      ON CONFLICT (address) DO UPDATE SET
+        pool_id = decode('458172bf46475e851b0e78f83d721c6bec86ad74a99caa1e3634fa5bb88a77ad', 'hex'),
+        chain = 'ethereum'
     `;
-    results.push('✅ Updated MFERSTR pool_id');
+    results.push('✅ MFERSTR inserted/updated');
   } catch (e: any) {
-    results.push(`⚠️ MFERSTR pool_id: ${e.message}`);
+    results.push(`⚠️ MFERSTR: ${e.message}`);
   }
   
   return c.json({ 
