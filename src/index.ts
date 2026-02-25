@@ -337,21 +337,13 @@ app.post('/tokens', async (c) => {
   }
   
   try {
-    // Parse request body - use raw Request to avoid Hono issues
+    // Parse request body
     let body;
     try {
-      // Clone the request to safely read the body
-      const clonedReq = c.req.raw.clone();
-      const rawBody = await clonedReq.text();
-      console.log('Raw body length:', rawBody?.length, 'Content:', rawBody?.slice(0, 100));
-      
-      if (!rawBody || rawBody.trim() === '') {
-        return c.json({ error: 'Empty request body' }, 400);
-      }
-      body = JSON.parse(rawBody);
+      body = await c.req.json();
     } catch (parseError: any) {
       console.error('JSON parse error:', parseError.message);
-      return c.json({ error: 'Invalid JSON in request body: ' + parseError.message }, 400);
+      return c.json({ error: 'Invalid JSON: ' + parseError.message }, 400);
     }
     const {
       address,
@@ -601,14 +593,28 @@ checkAllRpcHealth().then(() => {
 });
 
 // Create HTTP server and attach Socket.IO
-const httpServer = createServer((req, res) => {
-  // Let Hono handle HTTP requests
-  app.fetch(new Request(`http://localhost${req.url}`, {
+const httpServer = createServer(async (req, res) => {
+  // Collect request body for POST/PUT/PATCH
+  let body: Buffer[] = [];
+  for await (const chunk of req) {
+    body.push(chunk);
+  }
+  const bodyBuffer = Buffer.concat(body);
+  
+  // Let Hono handle HTTP requests - include body for non-GET requests
+  const requestInit: RequestInit = {
     method: req.method,
     headers: Object.fromEntries(
       Object.entries(req.headers).filter(([_, v]) => v !== undefined) as [string, string][]
     ),
-  })).then(async (response) => {
+  };
+  
+  // Add body for methods that support it
+  if (req.method !== 'GET' && req.method !== 'HEAD' && bodyBuffer.length > 0) {
+    requestInit.body = bodyBuffer;
+  }
+  
+  app.fetch(new Request(`http://localhost${req.url}`, requestInit)).then(async (response) => {
     res.statusCode = response.status;
     response.headers.forEach((value, key) => {
       res.setHeader(key, value);
