@@ -2,7 +2,7 @@
 
 Backend indexer and API for the cc0strategy protocol.
 
-**Supported Chains:** Base Mainnet (live), Ethereum Mainnet (pending)
+**Supported Chains:** Base Mainnet (live), Ethereum Mainnet (live)
 
 ## Quick Start
 
@@ -59,14 +59,17 @@ PORT=3000
 Contract addresses are stored in `src/config.ts`:
 
 ```typescript
-// Base Mainnet (LIVE)
-factory: '0x70b17db500Ce1746BB34f908140d0279C183f3eb'
-hook: '0x18aD8c9b72D33E69d8f02fDA61e3c7fAe4e728cc'
-feeDistributor: '0x9Ce2AB2769CcB547aAcE963ea4493001275CD557'
-lpLocker: '0x45e1D9bb68E514565710DEaf2567B73EF86638e0'
+// Base Mainnet (LIVE - V2)
+factory: '0xDbbC0A64fFe2a23b4543b0731CF61ef0d5d4E265'
+hook: '0x5eE3602f499cFEAa4E13D27b4F7D2661906b28cC'
+feeDistributor: '0x498bcfdbd724989fc37259faba75168c8f47080d'
+lpLocker: '0x5821e651D6fBF096dB3cBD9a21FaE4F5A1E2620A'
 
-// Ethereum Mainnet (PENDING)
-// Update config.ts when contracts are deployed
+// Ethereum Mainnet (LIVE - V2)
+factory: '0x1dc68bc05ecb132059fb45b281dbfa92b6fab610'
+hook: '0xEfd2F889eD9d7A2Bf6B6C9c2b20c5AEb6EBEe8Cc'
+feeDistributor: '0xdcfb59f2d41c58a1325b270c2f402c1884338d0d'
+lpLocker: '0x05492c0091e49374e71c93e74739d3f650b59077'
 ```
 
 ## Event Indexing (Future)
