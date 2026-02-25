@@ -144,6 +144,27 @@ function emitNewToken(token: any) {
 // ============================================
 const app = new Hono();
 
+// Sanitize URL helper
+function sanitizeUrl(url: string | null | undefined): string | null {
+  if (!url || typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) return null;
+  try { new URL(trimmed); return trimmed; } catch { return null; }
+}
+
+// Safe pool_id buffer conversion
+function safePoolIdBuffer(poolId: string | null | undefined): Buffer | null {
+  if (!poolId || typeof poolId !== 'string') return null;
+  const trimmed = poolId.trim();
+  if (!trimmed.startsWith('0x') || trimmed.length < 4) return null;
+  try {
+    return Buffer.from(trimmed.slice(2), 'hex');
+  } catch {
+    return null;
+  }
+}
+
 app.use('*', cors());
 
 // Health check with multi-chain RPC status
@@ -316,7 +337,18 @@ app.post('/tokens', async (c) => {
   }
   
   try {
-    const body = await c.req.json();
+    // Safely parse request body
+    let body;
+    try {
+      const rawBody = await c.req.text();
+      if (!rawBody || rawBody.trim() === '') {
+        return c.json({ error: 'Empty request body' }, 400);
+      }
+      body = JSON.parse(rawBody);
+    } catch (parseError: any) {
+      console.error('JSON parse error:', parseError.message);
+      return c.json({ error: 'Invalid JSON in request body: ' + parseError.message }, 400);
+    }
     const {
       address,
       name,
@@ -357,8 +389,8 @@ app.post('/tokens', async (c) => {
         ${address.toLowerCase()}, ${name}, ${symbol}, ${decimals}, ${nft_collection.toLowerCase()},
         ${deployer.toLowerCase()}, ${deploy_tx_hash}, ${deploy_block},
         ${deployed_at || new Date().toISOString()}, ${image_url || null}, ${description || null},
-        ${pool_id ? Buffer.from(pool_id.slice(2), 'hex') : null}, ${chain},
-        ${website_url || null}, ${twitter_url || null}, ${telegram_url || null}, ${discord_url || null}
+        ${safePoolIdBuffer(pool_id)}, ${chain},
+        ${sanitizeUrl(website_url)}, ${sanitizeUrl(twitter_url)}, ${sanitizeUrl(telegram_url)}, ${sanitizeUrl(discord_url)}
       )
       ON CONFLICT (address) DO UPDATE SET
         name = EXCLUDED.name,
