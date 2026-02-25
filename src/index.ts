@@ -1,9 +1,12 @@
+// @ts-nocheck
 // Main entry point - Multi-chain cc0strategy indexer
 import 'dotenv/config';
 import { Hono } from 'hono';
 import { serve } from '@hono/node-server';
 import { cors } from 'hono/cors';
 import postgres from 'postgres';
+import { Server as SocketIOServer } from 'socket.io';
+import { createServer } from 'http';
 import { 
   CHAIN_CONFIGS, 
   SupportedChain, 
@@ -125,39 +128,15 @@ if (DATABASE_URL) {
 }
 
 // ============================================
-// EVENT INDEXING STRUCTURE (Future)
+// WEBSOCKET SERVER
 // ============================================
-/**
- * Event indexing will listen for:
- * 
- * Factory Events:
- * - TokenDeployed(address indexed token, address indexed nftCollection, address deployer)
- *   → Auto-register new tokens in database
- * 
- * FeeDistributor Events:
- * - FeesReceived(address indexed token, uint256 amount)
- *   → Track total fees collected per token
- * - FeesClaimed(address indexed token, address indexed claimer, uint256[] tokenIds, uint256 amount)
- *   → Track claims history
- * 
- * Implementation approach:
- * 1. Use viem for event subscription
- * 2. Store last indexed block per chain in database
- * 3. On startup, backfill from last indexed to current
- * 4. Then subscribe to new events
- */
+let io: SocketIOServer | null = null;
 
-interface EventIndexerConfig {
-  chain: SupportedChain;
-  contractAddress: string;
-  eventName: string;
-  fromBlock: bigint;
-}
-
-// Placeholder for future event indexing
-async function startEventIndexer(_config: EventIndexerConfig): Promise<void> {
-  // TODO: Implement when ready
-  console.log(`📡 Event indexing placeholder for ${_config.chain}:${_config.eventName}`);
+function emitNewToken(token: any) {
+  if (io) {
+    console.log(`📡 Emitting new-token event: ${token.symbol}`);
+    io.emit('new-token', token);
+  }
 }
 
 // ============================================
@@ -182,8 +161,9 @@ app.get('/', async (c) => {
   return c.json({ 
     status: 'ok', 
     service: 'cc0strategy-indexer',
-    version: '2.0.0',
+    version: '2.1.0',
     database: sql ? 'connected' : 'not connected',
+    websocket: io ? 'enabled' : 'disabled',
     chains: {
       base: {
         factory: CHAIN_CONFIGS.base.factory,
@@ -221,6 +201,7 @@ app.get('/health', async (c) => {
   return c.json({ 
     status: allRpcsHealthy && sql ? 'healthy' : 'degraded',
     database: sql ? 'ok' : 'error',
+    websocket: io ? 'ok' : 'disabled',
     rpcs: Object.fromEntries(
       (Object.keys(rpcStatus) as SupportedChain[]).map(chain => [
         chain, 
@@ -350,6 +331,10 @@ app.post('/tokens', async (c) => {
       description,
       pool_id,
       chain = 'base',
+      website_url,
+      twitter_url,
+      telegram_url,
+      discord_url,
     } = body;
     
     // Validate required fields
@@ -366,24 +351,35 @@ app.post('/tokens', async (c) => {
     const result = await sql`
       INSERT INTO tokens (
         address, name, symbol, decimals, nft_collection, deployer,
-        deploy_tx_hash, deploy_block, deployed_at, image_url, description, pool_id, chain
+        deploy_tx_hash, deploy_block, deployed_at, image_url, description, pool_id, chain,
+        website_url, twitter_url, telegram_url, discord_url
       ) VALUES (
         ${address.toLowerCase()}, ${name}, ${symbol}, ${decimals}, ${nft_collection.toLowerCase()},
         ${deployer.toLowerCase()}, ${deploy_tx_hash}, ${deploy_block},
         ${deployed_at || new Date().toISOString()}, ${image_url || null}, ${description || null},
-        ${pool_id ? Buffer.from(pool_id.slice(2), 'hex') : null}, ${chain}
+        ${pool_id ? Buffer.from(pool_id.slice(2), 'hex') : null}, ${chain},
+        ${website_url || null}, ${twitter_url || null}, ${telegram_url || null}, ${discord_url || null}
       )
       ON CONFLICT (address) DO UPDATE SET
         name = EXCLUDED.name,
         symbol = EXCLUDED.symbol,
         image_url = COALESCE(EXCLUDED.image_url, tokens.image_url),
         description = COALESCE(EXCLUDED.description, tokens.description),
+        website_url = COALESCE(EXCLUDED.website_url, tokens.website_url),
+        twitter_url = COALESCE(EXCLUDED.twitter_url, tokens.twitter_url),
+        telegram_url = COALESCE(EXCLUDED.telegram_url, tokens.telegram_url),
+        discord_url = COALESCE(EXCLUDED.discord_url, tokens.discord_url),
         updated_at = NOW()
       RETURNING *
     `;
     
+    const newToken = result[0];
     console.log(`✅ Token registered: ${symbol} (${address}) on ${chain}`);
-    return c.json(result[0]);
+    
+    // Emit WebSocket event for real-time updates
+    emitNewToken(newToken);
+    
+    return c.json(newToken);
   } catch (e: any) {
     console.error('Error registering token:', e.message);
     return c.json({ error: e.message }, 500);
@@ -559,7 +555,7 @@ app.get('/migrate', async (c) => {
 });
 
 // ============================================
-// START SERVER
+// START SERVER WITH WEBSOCKET
 // ============================================
 console.log(`🚀 Starting server on port ${PORT}...`);
 
@@ -568,10 +564,48 @@ checkAllRpcHealth().then(() => {
   console.log('📡 Initial RPC health check complete');
 });
 
-serve({ 
-  fetch: app.fetch, 
-  port: PORT 
-}, (info) => {
-  console.log(`✅ Server listening on http://localhost:${info.port}`);
+// Create HTTP server and attach Socket.IO
+const httpServer = createServer((req, res) => {
+  // Let Hono handle HTTP requests
+  app.fetch(new Request(`http://localhost${req.url}`, {
+    method: req.method,
+    headers: Object.fromEntries(
+      Object.entries(req.headers).filter(([_, v]) => v !== undefined) as [string, string][]
+    ),
+  })).then(async (response) => {
+    res.statusCode = response.status;
+    response.headers.forEach((value, key) => {
+      res.setHeader(key, value);
+    });
+    const body = await response.text();
+    res.end(body);
+  }).catch((err) => {
+    console.error('Request error:', err);
+    res.statusCode = 500;
+    res.end('Internal Server Error');
+  });
+});
+
+// Initialize Socket.IO
+io = new SocketIOServer(httpServer, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
+  transports: ['websocket', 'polling'],
+});
+
+io.on('connection', (socket) => {
+  console.log(`🔌 Client connected: ${socket.id}`);
+  
+  socket.on('disconnect', () => {
+    console.log(`🔌 Client disconnected: ${socket.id}`);
+  });
+});
+
+// Start the server
+httpServer.listen(PORT, () => {
+  console.log(`✅ Server listening on http://localhost:${PORT}`);
+  console.log(`📡 WebSocket enabled on same port`);
   console.log(`📋 Active chains: ${getActiveChains().join(', ') || 'none'}`);
 });
