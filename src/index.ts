@@ -337,10 +337,14 @@ app.post('/tokens', async (c) => {
   }
   
   try {
-    // Safely parse request body
+    // Parse request body - use raw Request to avoid Hono issues
     let body;
     try {
-      const rawBody = await c.req.text();
+      // Clone the request to safely read the body
+      const clonedReq = c.req.raw.clone();
+      const rawBody = await clonedReq.text();
+      console.log('Raw body length:', rawBody?.length, 'Content:', rawBody?.slice(0, 100));
+      
       if (!rawBody || rawBody.trim() === '') {
         return c.json({ error: 'Empty request body' }, 400);
       }
