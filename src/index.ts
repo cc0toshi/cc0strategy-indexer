@@ -210,8 +210,8 @@ const FEE_DISTRIBUTOR_ABI = [
 function encodeCall(funcName: string, args: string[]): string {
   // Simple encoder for our specific case: single address arg
   const funcSigs: Record<string, string> = {
-    'accumulatedRewards': '0x9181df8c',  // bytes4(keccak256("accumulatedRewards(address)"))
-    'tokenToNftSupply': '0x3e584b5c',    // bytes4(keccak256("tokenToNftSupply(address)"))
+    'accumulatedRewards': '0x73f273fc',  // bytes4(keccak256("accumulatedRewards(address)"))
+    'tokenToNftSupply': '0x8fb0cb97',    // bytes4(keccak256("tokenToNftSupply(address)"))
   };
   const selector = funcSigs[funcName];
   if (!selector) throw new Error(`Unknown function: ${funcName}`);
