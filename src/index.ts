@@ -16,6 +16,7 @@ import {
   getActiveChains,
   validateChain 
 } from './config.js';
+import { createMarketplaceRoutes } from './marketplace.js';
 
 // ============================================
 // CACHE CONFIGURATION
@@ -481,6 +482,8 @@ function safePoolIdBuffer(poolId: string | null | undefined): Buffer | null {
 }
 
 app.use('*', cors());
+// Mount marketplace routes
+app.route('/marketplace', createMarketplaceRoutes(sql));
 
 // Health check with multi-chain RPC status
 app.get('/', async (c) => {
