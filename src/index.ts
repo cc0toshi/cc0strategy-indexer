@@ -18,6 +18,51 @@ import {
 } from './config.js';
 
 // ============================================
+// CACHE CONFIGURATION
+// ============================================
+const MARKET_DATA_REFRESH_MS = 60 * 1000;  // 60 seconds
+const REWARDS_REFRESH_MS = 30 * 1000;       // 30 seconds
+const COLLECTION_INFO_REFRESH_MS = 5 * 60 * 1000; // 5 minutes (rarely changes)
+
+interface MarketData {
+  priceUsd: number;
+  priceChange24h: number;
+  volume24h: number;
+  marketCap: number;
+  fdv: number;
+  liquidity: number;
+  lastUpdated: number;
+}
+
+interface RewardsData {
+  totalRewards: string;
+  accRewardPerNFT: string;
+  nftSupply: string;
+  lastUpdated: number;
+}
+
+interface CollectionInfo {
+  name: string | null;
+  image: string | null;
+  lastUpdated: number;
+}
+
+interface TokenCache {
+  address: string;
+  chain: SupportedChain;
+  market?: MarketData;
+  rewards?: RewardsData;
+}
+
+// In-memory caches
+const marketCache: Map<string, MarketData> = new Map();
+const rewardsCache: Map<string, RewardsData> = new Map();
+const collectionCache: Map<string, CollectionInfo> = new Map();
+let lastMarketRefresh = 0;
+let lastRewardsRefresh = 0;
+let cacheRefreshInProgress = false;
+
+// ============================================
 // CONFIGURATION
 // ============================================
 const PORT = parseInt(process.env.PORT || '3000');
@@ -137,6 +182,276 @@ function emitNewToken(token: any) {
     console.log(`📡 Emitting new-token event: ${token.symbol}`);
     io.emit('new-token', token);
   }
+}
+
+// ============================================
+// CACHE REFRESH FUNCTIONS
+// ============================================
+
+// FeeDistributor ABI (minimal for rewards)
+const FEE_DISTRIBUTOR_ABI = [
+  {
+    name: 'accumulatedRewards',
+    type: 'function',
+    inputs: [{ name: 'token', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+  },
+  {
+    name: 'tokenToNftSupply',
+    type: 'function',
+    inputs: [{ name: 'token', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
+    stateMutability: 'view',
+  },
+];
+
+// ABI encode function call
+function encodeCall(funcName: string, args: string[]): string {
+  // Simple encoder for our specific case: single address arg
+  const funcSigs: Record<string, string> = {
+    'accumulatedRewards': '0x9181df8c',  // bytes4(keccak256("accumulatedRewards(address)"))
+    'tokenToNftSupply': '0x3e584b5c',    // bytes4(keccak256("tokenToNftSupply(address)"))
+  };
+  const selector = funcSigs[funcName];
+  if (!selector) throw new Error(`Unknown function: ${funcName}`);
+  // Pad address to 32 bytes
+  const paddedArg = args[0].toLowerCase().replace('0x', '').padStart(64, '0');
+  return selector + paddedArg;
+}
+
+// Decode uint256 from RPC response
+function decodeUint256(hex: string): bigint {
+  if (!hex || hex === '0x') return 0n;
+  return BigInt(hex);
+}
+
+// Format wei to ETH string
+function formatEther(wei: bigint): string {
+  const str = wei.toString().padStart(19, '0');
+  const intPart = str.slice(0, -18) || '0';
+  const decPart = str.slice(-18).replace(/0+$/, '') || '0';
+  return decPart === '0' ? intPart : `${intPart}.${decPart}`;
+}
+
+// Fetch market data from GeckoTerminal
+async function fetchMarketData(tokenAddress: string, chain: SupportedChain): Promise<MarketData | null> {
+  const networkId = chain === 'ethereum' ? 'eth' : 'base';
+  const poolsUrl = `https://api.geckoterminal.com/api/v2/networks/${networkId}/tokens/${tokenAddress.toLowerCase()}/pools?page=1`;
+  
+  try {
+    const response = await fetch(poolsUrl, {
+      headers: { 'Accept': 'application/json' },
+    });
+    
+    if (!response.ok) return null;
+    
+    const data = await response.json();
+    const pools = data.data;
+    
+    if (!pools || pools.length === 0) return null;
+    
+    const pool = pools[0];
+    const poolAttrs = pool.attributes;
+    if (!poolAttrs) return null;
+    
+    // Get price from pool - check which token we need
+    const baseTokenPrice = parseFloat(poolAttrs.base_token_price_usd || '0');
+    const quoteTokenPrice = parseFloat(poolAttrs.quote_token_price_usd || '0');
+    const baseTokenAddr = pool.relationships?.base_token?.data?.id?.split('_')[1]?.toLowerCase();
+    const isBaseToken = baseTokenAddr === tokenAddress.toLowerCase();
+    const priceUsd = isBaseToken ? baseTokenPrice : quoteTokenPrice;
+    
+    return {
+      priceUsd,
+      priceChange24h: parseFloat(poolAttrs.price_change_percentage?.h24 || '0'),
+      volume24h: parseFloat(poolAttrs.volume_usd?.h24 || '0'),
+      marketCap: parseFloat(poolAttrs.market_cap_usd || '0') || parseFloat(poolAttrs.fdv_usd || '0'),
+      fdv: parseFloat(poolAttrs.fdv_usd || '0'),
+      liquidity: parseFloat(poolAttrs.reserve_in_usd || '0'),
+      lastUpdated: Date.now(),
+    };
+  } catch (e) {
+    console.error(`GeckoTerminal error for ${tokenAddress}:`, e);
+    return null;
+  }
+}
+
+// Fetch rewards data from FeeDistributor
+async function fetchRewardsData(tokenAddress: string, chain: SupportedChain): Promise<RewardsData | null> {
+  const rpcUrl = getRpcUrl(chain);
+  const config = CHAIN_CONFIGS[chain];
+  
+  if (!rpcUrl || !config.feeDistributor) return null;
+  
+  try {
+    // Batch RPC calls
+    const calls = [
+      {
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: config.feeDistributor, data: encodeCall('accumulatedRewards', [tokenAddress]) }, 'latest'],
+        id: 1,
+      },
+      {
+        jsonrpc: '2.0',
+        method: 'eth_call',
+        params: [{ to: config.feeDistributor, data: encodeCall('tokenToNftSupply', [tokenAddress]) }, 'latest'],
+        id: 2,
+      },
+    ];
+    
+    const response = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(calls),
+    });
+    
+    if (!response.ok) return null;
+    
+    const results = await response.json();
+    
+    const accRewardPerNFT = decodeUint256(results[0]?.result);
+    const nftSupply = decodeUint256(results[1]?.result);
+    
+    // Total rewards = accRewardPerNFT * nftSupply / 1e18 (PRECISION)
+    const totalRewardsWei = (accRewardPerNFT * nftSupply) / (10n ** 18n);
+    
+    return {
+      totalRewards: formatEther(totalRewardsWei),
+      accRewardPerNFT: accRewardPerNFT.toString(),
+      nftSupply: nftSupply.toString(),
+      lastUpdated: Date.now(),
+    };
+  } catch (e) {
+    console.error(`Rewards fetch error for ${tokenAddress} on ${chain}:`, e);
+    return null;
+  }
+}
+
+// Fetch collection info from OpenSea/Reservoir
+async function fetchCollectionInfo(collectionAddress: string, chain: SupportedChain): Promise<CollectionInfo | null> {
+  // Try OpenSea API first (public endpoint)
+  const networkSlug = chain === 'ethereum' ? 'ethereum' : 'base';
+  const url = `https://api.opensea.io/api/v2/chain/${networkSlug}/contract/${collectionAddress.toLowerCase()}`;
+  
+  try {
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+    });
+    
+    if (response.ok) {
+      const data = await response.json();
+      return {
+        name: data.collection || data.name || null,
+        image: data.image_url || null,
+        lastUpdated: Date.now(),
+      };
+    }
+  } catch (e) {
+    console.error(`Collection info error for ${collectionAddress}:`, e);
+  }
+  
+  return null;
+}
+
+// Refresh all market data
+async function refreshMarketCache(): Promise<void> {
+  if (!sql || cacheRefreshInProgress) return;
+  
+  const now = Date.now();
+  if (now - lastMarketRefresh < MARKET_DATA_REFRESH_MS) return;
+  
+  try {
+    const tokens = await sql`SELECT address, chain FROM tokens`;
+    console.log(`📊 Refreshing market data for ${tokens.length} tokens...`);
+    
+    // Process in parallel with rate limiting (5 concurrent)
+    const batchSize = 5;
+    for (let i = 0; i < tokens.length; i += batchSize) {
+      const batch = tokens.slice(i, i + batchSize);
+      await Promise.all(batch.map(async (token) => {
+        const data = await fetchMarketData(token.address, token.chain as SupportedChain);
+        if (data) {
+          marketCache.set(`${token.chain}:${token.address.toLowerCase()}`, data);
+        }
+      }));
+      // Small delay between batches to avoid rate limits
+      if (i + batchSize < tokens.length) {
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+    
+    lastMarketRefresh = now;
+    console.log(`✅ Market cache refreshed (${marketCache.size} entries)`);
+  } catch (e) {
+    console.error('Market cache refresh error:', e);
+  }
+}
+
+// Refresh all rewards data
+async function refreshRewardsCache(): Promise<void> {
+  if (!sql || cacheRefreshInProgress) return;
+  
+  const now = Date.now();
+  if (now - lastRewardsRefresh < REWARDS_REFRESH_MS) return;
+  
+  try {
+    const tokens = await sql`SELECT address, chain FROM tokens`;
+    console.log(`💰 Refreshing rewards data for ${tokens.length} tokens...`);
+    
+    // Process per chain (batch RPC calls within same chain)
+    for (const chain of ['base', 'ethereum'] as SupportedChain[]) {
+      const chainTokens = tokens.filter(t => t.chain === chain);
+      
+      await Promise.all(chainTokens.map(async (token) => {
+        const data = await fetchRewardsData(token.address, chain);
+        if (data) {
+          rewardsCache.set(`${chain}:${token.address.toLowerCase()}`, data);
+        }
+      }));
+    }
+    
+    lastRewardsRefresh = now;
+    console.log(`✅ Rewards cache refreshed (${rewardsCache.size} entries)`);
+  } catch (e) {
+    console.error('Rewards cache refresh error:', e);
+  }
+}
+
+// Full cache refresh (market + rewards)
+async function refreshAllCaches(): Promise<void> {
+  if (cacheRefreshInProgress) return;
+  cacheRefreshInProgress = true;
+  
+  try {
+    await Promise.all([
+      refreshMarketCache(),
+      refreshRewardsCache(),
+    ]);
+  } finally {
+    cacheRefreshInProgress = false;
+  }
+}
+
+// Start background cache refresh loops
+function startCacheRefreshLoops(): void {
+  // Initial refresh after 5 seconds
+  setTimeout(() => {
+    refreshAllCaches();
+  }, 5000);
+  
+  // Market data: every 60 seconds
+  setInterval(() => {
+    refreshMarketCache();
+  }, MARKET_DATA_REFRESH_MS);
+  
+  // Rewards data: every 30 seconds
+  setInterval(() => {
+    refreshRewardsCache();
+  }, REWARDS_REFRESH_MS);
+  
+  console.log('🔄 Cache refresh loops started');
 }
 
 // ============================================
@@ -443,6 +758,197 @@ app.get('/stats', async (c) => {
   }
 });
 
+// ============================================
+// CACHE API ENDPOINTS
+// ============================================
+
+// GET /cache/market - All cached market data
+app.get('/cache/market', (c) => {
+  const chainFilter = c.req.query('chain');
+  const result: Record<string, MarketData> = {};
+  
+  for (const [key, data] of marketCache.entries()) {
+    const [chain, address] = key.split(':');
+    if (!chainFilter || chain === chainFilter) {
+      result[address] = data;
+    }
+  }
+  
+  return c.json({
+    data: result,
+    count: Object.keys(result).length,
+    lastRefresh: lastMarketRefresh,
+    nextRefresh: lastMarketRefresh + MARKET_DATA_REFRESH_MS,
+    filter: chainFilter || null,
+  });
+});
+
+// GET /cache/rewards - All cached rewards data
+app.get('/cache/rewards', (c) => {
+  const chainFilter = c.req.query('chain');
+  const result: Record<string, RewardsData> = {};
+  
+  for (const [key, data] of rewardsCache.entries()) {
+    const [chain, address] = key.split(':');
+    if (!chainFilter || chain === chainFilter) {
+      result[address] = data;
+    }
+  }
+  
+  return c.json({
+    data: result,
+    count: Object.keys(result).length,
+    lastRefresh: lastRewardsRefresh,
+    nextRefresh: lastRewardsRefresh + REWARDS_REFRESH_MS,
+    filter: chainFilter || null,
+  });
+});
+
+// GET /cache/all - Combined market + rewards for all tokens (main endpoint for frontend)
+app.get('/cache/all', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  const chainFilter = c.req.query('chain');
+  
+  try {
+    // Get tokens from DB
+    let tokens;
+    if (chainFilter && validateChain(chainFilter)) {
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url FROM tokens WHERE chain = ${chainFilter} ORDER BY deployed_at DESC`;
+    } else {
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url FROM tokens ORDER BY deployed_at DESC`;
+    }
+    
+    // Combine with cache data
+    const combined = tokens.map((token: any) => {
+      const cacheKey = `${token.chain}:${token.address.toLowerCase()}`;
+      const market = marketCache.get(cacheKey);
+      const rewards = rewardsCache.get(cacheKey);
+      
+      return {
+        address: token.address,
+        chain: token.chain,
+        name: token.name,
+        symbol: token.symbol,
+        nftCollection: token.nft_collection,
+        imageUrl: token.image_url,
+        deployedAt: token.deployed_at,
+        websiteUrl: token.website_url,
+        twitterUrl: token.twitter_url,
+        telegramUrl: token.telegram_url,
+        discordUrl: token.discord_url,
+        market: market ? {
+          priceUsd: market.priceUsd,
+          priceChange24h: market.priceChange24h,
+          volume24h: market.volume24h,
+          marketCap: market.marketCap,
+          fdv: market.fdv,
+          liquidity: market.liquidity,
+        } : null,
+        rewards: rewards ? {
+          totalRewards: rewards.totalRewards,
+          accRewardPerNFT: rewards.accRewardPerNFT,
+          nftSupply: rewards.nftSupply,
+        } : null,
+      };
+    });
+    
+    return c.json({
+      tokens: combined,
+      count: combined.length,
+      cache: {
+        marketLastRefresh: lastMarketRefresh,
+        rewardsLastRefresh: lastRewardsRefresh,
+      },
+      filter: chainFilter || null,
+    });
+  } catch (e: any) {
+    console.error('Cache/all error:', e);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+// GET /cache/token/:address - Single token cached data
+app.get('/cache/token/:address', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  const address = c.req.param('address').toLowerCase();
+  
+  try {
+    const [token] = await sql`SELECT * FROM tokens WHERE address = ${address}`;
+    if (!token) {
+      return c.json({ error: 'Token not found' }, 404);
+    }
+    
+    const cacheKey = `${token.chain}:${address}`;
+    const market = marketCache.get(cacheKey);
+    const rewards = rewardsCache.get(cacheKey);
+    
+    return c.json({
+      token: {
+        address: token.address,
+        chain: token.chain,
+        name: token.name,
+        symbol: token.symbol,
+        nftCollection: token.nft_collection,
+        imageUrl: token.image_url,
+        deployedAt: token.deployed_at,
+        websiteUrl: token.website_url,
+        twitterUrl: token.twitter_url,
+        telegramUrl: token.telegram_url,
+        discordUrl: token.discord_url,
+      },
+      market: market || null,
+      rewards: rewards || null,
+    });
+  } catch (e: any) {
+    console.error('Cache/token error:', e);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+// POST /cache/refresh - Force cache refresh (for admin/testing)
+app.post('/cache/refresh', async (c) => {
+  if (cacheRefreshInProgress) {
+    return c.json({ status: 'already_in_progress' });
+  }
+  
+  // Don't await - return immediately
+  refreshAllCaches();
+  
+  return c.json({ 
+    status: 'started',
+    message: 'Cache refresh initiated',
+  });
+});
+
+// GET /cache/status - Cache status info
+app.get('/cache/status', (c) => {
+  const now = Date.now();
+  return c.json({
+    market: {
+      entries: marketCache.size,
+      lastRefresh: lastMarketRefresh,
+      nextRefresh: lastMarketRefresh + MARKET_DATA_REFRESH_MS,
+      stale: now - lastMarketRefresh > MARKET_DATA_REFRESH_MS,
+      refreshIntervalMs: MARKET_DATA_REFRESH_MS,
+    },
+    rewards: {
+      entries: rewardsCache.size,
+      lastRefresh: lastRewardsRefresh,
+      nextRefresh: lastRewardsRefresh + REWARDS_REFRESH_MS,
+      stale: now - lastRewardsRefresh > REWARDS_REFRESH_MS,
+      refreshIntervalMs: REWARDS_REFRESH_MS,
+    },
+    refreshInProgress: cacheRefreshInProgress,
+    timestamp: now,
+  });
+});
+
 // GET /config - Return chain configurations (public info only)
 app.get('/config', (c) => {
   const publicConfig = Object.fromEntries(
@@ -591,6 +1097,9 @@ console.log(`🚀 Starting server on port ${PORT}...`);
 checkAllRpcHealth().then(() => {
   console.log('📡 Initial RPC health check complete');
 });
+
+// Start cache refresh loops
+startCacheRefreshLoops();
 
 // Create HTTP server and attach Socket.IO
 const httpServer = createServer(async (req, res) => {

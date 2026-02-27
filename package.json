@@ -23,6 +23,7 @@
   "devDependencies": {
     "@railway/cli": "^4.30.3",
     "@types/node": "^22.12.0",
-    "@types/pg": "^8.11.11"
+    "@types/pg": "^8.11.11",
+    "simple-git": "^3.32.2"
   }
 }
