@@ -649,6 +649,195 @@ app.delete('/tokens/:address', async (c) => {
   }
 });
 
+// ============================================
+// TOKEN VERIFICATION ENDPOINTS
+// ============================================
+const VERIFICATION_RECIPIENT = '0x58e510F849e38095375a3e478ad1d719650b8557'.toLowerCase();
+const VERIFICATION_AMOUNT_WEI = BigInt('100000000000000000'); // 0.1 ETH
+
+// Helper to verify transaction on-chain
+async function verifyTransaction(txHash: string, chain: SupportedChain): Promise<{
+  valid: boolean;
+  from?: string;
+  to?: string;
+  value?: bigint;
+  error?: string;
+}> {
+  try {
+    const rpcUrl = getRpcUrl(chain);
+    if (!rpcUrl) {
+      return { valid: false, error: 'RPC not configured for chain' };
+    }
+    
+    // Get transaction receipt
+    const receiptResponse = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'eth_getTransactionReceipt',
+        params: [txHash],
+      }),
+    });
+    
+    const receiptData = await receiptResponse.json();
+    if (!receiptData.result) {
+      return { valid: false, error: 'Transaction not found or not confirmed' };
+    }
+    
+    if (receiptData.result.status !== '0x1') {
+      return { valid: false, error: 'Transaction failed' };
+    }
+    
+    // Get full transaction details
+    const txResponse = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'eth_getTransactionByHash',
+        params: [txHash],
+      }),
+    });
+    
+    const txData = await txResponse.json();
+    if (!txData.result) {
+      return { valid: false, error: 'Transaction details not found' };
+    }
+    
+    const { from, to, value } = txData.result;
+    return {
+      valid: true,
+      from: from?.toLowerCase(),
+      to: to?.toLowerCase(),
+      value: value ? BigInt(value) : 0n,
+    };
+  } catch (e: any) {
+    return { valid: false, error: e.message || 'Failed to verify transaction' };
+  }
+}
+
+// POST /tokens/verify - Verify a token with payment proof
+app.post('/tokens/verify', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  try {
+    const body = await c.req.json();
+    const { tokenAddress, email, twitter, website, txHash } = body;
+    
+    if (!tokenAddress || !txHash) {
+      return c.json({ error: 'Missing required fields: tokenAddress, txHash' }, 400);
+    }
+    
+    // Get the token from database
+    const tokens = await sql`
+      SELECT address, deployer, chain, is_verified 
+      FROM tokens 
+      WHERE address = ${tokenAddress.toLowerCase()}
+    `;
+    
+    if (!tokens || tokens.length === 0) {
+      return c.json({ error: 'Token not found' }, 404);
+    }
+    
+    const token = tokens[0];
+    
+    if (token.is_verified) {
+      return c.json({ error: 'Token is already verified' }, 400);
+    }
+    
+    const chain = (token.chain || 'base') as SupportedChain;
+    
+    // Verify the transaction
+    const txVerification = await verifyTransaction(txHash, chain);
+    if (!txVerification.valid) {
+      return c.json({ error: txVerification.error || 'Invalid transaction' }, 400);
+    }
+    
+    // Check recipient
+    if (txVerification.to !== VERIFICATION_RECIPIENT) {
+      return c.json({ 
+        error: `Transaction must be sent to ${VERIFICATION_RECIPIENT}`,
+        got: txVerification.to
+      }, 400);
+    }
+    
+    // Check value >= 0.1 ETH
+    if (!txVerification.value || txVerification.value < VERIFICATION_AMOUNT_WEI) {
+      return c.json({ 
+        error: 'Transaction must send at least 0.1 ETH',
+        got: txVerification.value?.toString()
+      }, 400);
+    }
+    
+    // Check sender matches deployer
+    const deployer = token.deployer?.toLowerCase();
+    if (txVerification.from !== deployer) {
+      return c.json({ 
+        error: 'Transaction must be sent from the token deployer address',
+        expected: deployer,
+        got: txVerification.from
+      }, 400);
+    }
+    
+    // All checks passed - update the token
+    await sql`
+      UPDATE tokens 
+      SET 
+        is_verified = true,
+        deployer_email = ${email || null},
+        deployer_twitter = ${twitter || null},
+        deployer_website = ${website || null},
+        verified_at = NOW()
+      WHERE address = ${tokenAddress.toLowerCase()}
+    `;
+    
+    console.log(`✅ Token verified: ${tokenAddress}`);
+    return c.json({ 
+      success: true, 
+      message: 'Token verified successfully',
+      tokenAddress: tokenAddress.toLowerCase()
+    });
+    
+  } catch (e: any) {
+    console.error('Verification error:', e);
+    return c.json({ error: e.message || 'Verification failed' }, 500);
+  }
+});
+
+// GET /tokens/:address/verify-status - Get verification status
+app.get('/tokens/:address/verify-status', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  try {
+    const address = c.req.param('address').toLowerCase();
+    
+    const result = await sql`
+      SELECT is_verified, verified_at
+      FROM tokens
+      WHERE address = ${address}
+    `;
+    
+    if (!result || result.length === 0) {
+      return c.json({ error: 'Token not found' }, 404);
+    }
+    
+    return c.json({
+      isVerified: result[0].is_verified || false,
+      verifiedAt: result[0].verified_at || null
+    });
+  } catch (e: any) {
+    console.error('Verify status error:', e);
+    return c.json({ error: e.message || 'Failed to get verification status' }, 500);
+  }
+});
+
 // POST /tokens - Register new token
 app.post('/tokens', async (c) => {
   if (!sql) {
