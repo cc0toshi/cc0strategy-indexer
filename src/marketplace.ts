@@ -1,12 +1,18 @@
 // Marketplace API Routes for cc0strategy
 import { Hono } from 'hono';
 import type postgres from 'postgres';
+import { randomBytes } from 'crypto';
 
 const TREASURY = '0x58e510f849e38095375a3e478ad1d719650b8557';
 const PLATFORM_FEE_BPS = 100; // 1%
 const SEAPORT_ADDRESS = '0x0000000000000068F116a894984e2DB1123eB395';
 
 type Sql = ReturnType<typeof postgres>;
+
+// Generate a random order hash if not provided
+function generateOrderHash(): string {
+  return '0x' + randomBytes(32).toString('hex');
+}
 
 export function createMarketplaceRoutes(sql: Sql | null) {
   const marketplace = new Hono();
@@ -230,6 +236,218 @@ export function createMarketplaceRoutes(sql: Sql | null) {
   });
 
   // ============================================
+  // OFFERS/BIDS API
+  // ============================================
+
+  // GET /marketplace/offers - Get offers for a collection/token
+  marketplace.get('/offers', async (c) => {
+    if (!sql) return c.json({ error: 'Database not configured' }, 500);
+
+    try {
+      const collection = c.req.query('collection')?.toLowerCase();
+      const tokenId = c.req.query('tokenId');
+      const offerer = c.req.query('offerer')?.toLowerCase();
+      const chain = c.req.query('chain') || 'base';
+      const status = c.req.query('status') || 'active';
+      const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
+      const offset = parseInt(c.req.query('offset') || '0');
+
+      let offers;
+      if (collection && tokenId) {
+        offers = await sql`
+          SELECT * FROM marketplace_offers 
+          WHERE collection_address = ${collection} AND token_id = ${tokenId} 
+            AND chain = ${chain} AND status = ${status}
+            AND end_time > NOW()
+          ORDER BY CAST(amount_wei AS NUMERIC) DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      } else if (collection) {
+        offers = await sql`
+          SELECT * FROM marketplace_offers 
+          WHERE collection_address = ${collection} AND chain = ${chain} AND status = ${status}
+            AND end_time > NOW()
+          ORDER BY CAST(amount_wei AS NUMERIC) DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      } else if (offerer) {
+        offers = await sql`
+          SELECT * FROM marketplace_offers 
+          WHERE offerer = ${offerer} AND chain = ${chain} AND status = ${status}
+            AND end_time > NOW()
+          ORDER BY created_at DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      } else {
+        offers = await sql`
+          SELECT * FROM marketplace_offers 
+          WHERE chain = ${chain} AND status = ${status}
+            AND end_time > NOW()
+          ORDER BY created_at DESC
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      }
+
+      return c.json({
+        offers,
+        pagination: { limit, offset },
+        filter: { collection, tokenId, offerer, chain, status }
+      });
+    } catch (e: any) {
+      console.error('Error fetching offers:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // GET /marketplace/offers/:orderHash - Get single offer
+  marketplace.get('/offers/:orderHash', async (c) => {
+    if (!sql) return c.json({ error: 'Database not configured' }, 500);
+
+    try {
+      const orderHash = c.req.param('orderHash').toLowerCase();
+      const [offer] = await sql`
+        SELECT * FROM marketplace_offers WHERE order_hash = ${orderHash}
+      `;
+
+      if (!offer) {
+        return c.json({ error: 'Offer not found' }, 404);
+      }
+
+      return c.json(offer);
+    } catch (e: any) {
+      console.error('Error fetching offer:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // POST /marketplace/offers - Create new offer/bid
+  marketplace.post('/offers', async (c) => {
+    if (!sql) return c.json({ error: 'Database not configured' }, 500);
+
+    try {
+      const body = await c.req.json();
+      const {
+        collectionAddress,
+        tokenId,
+        offerer,
+        amountWei,
+        endTime,
+        orderData,
+        signature,
+        chain = 'base'
+      } = body;
+
+      if (!collectionAddress || !tokenId || !offerer || !amountWei || !endTime) {
+        return c.json({ error: 'Missing required fields' }, 400);
+      }
+
+      // Generate order hash from order data or create one
+      const orderHash = generateOrderHash();
+
+      const [offer] = await sql`
+        INSERT INTO marketplace_offers (
+          order_hash, collection_address, token_id, offerer, amount_wei,
+          end_time, order_data, signature, chain, status
+        ) VALUES (
+          ${orderHash},
+          ${collectionAddress.toLowerCase()},
+          ${tokenId},
+          ${offerer.toLowerCase()},
+          ${amountWei},
+          ${new Date(endTime * 1000)},
+          ${orderData ? JSON.stringify(orderData) : null},
+          ${signature || null},
+          ${chain},
+          'active'
+        )
+        RETURNING *
+      `;
+
+      // Log activity
+      await sql`
+        INSERT INTO marketplace_activity (
+          event_type, collection_address, token_id, from_address, price_wei, chain, timestamp
+        ) VALUES (
+          'offer', ${collectionAddress.toLowerCase()}, ${tokenId}, 
+          ${offerer.toLowerCase()}, ${amountWei}, ${chain}, NOW()
+        )
+      `;
+
+      console.log(`🤝 New offer: ${collectionAddress} #${tokenId} for ${amountWei} wei WETH`);
+      return c.json(offer);
+    } catch (e: any) {
+      console.error('Error creating offer:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // POST /marketplace/offers/:orderHash/fill - Mark offer as filled (accepted)
+  marketplace.post('/offers/:orderHash/fill', async (c) => {
+    if (!sql) return c.json({ error: 'Database not configured' }, 500);
+
+    try {
+      const orderHash = c.req.param('orderHash').toLowerCase();
+      const body = await c.req.json();
+      const { filledBy, txHash } = body;
+
+      const [offer] = await sql`
+        UPDATE marketplace_offers 
+        SET status = 'filled', filled_at = NOW(), filled_by = ${filledBy?.toLowerCase()}, filled_tx_hash = ${txHash}
+        WHERE order_hash = ${orderHash}
+        RETURNING *
+      `;
+
+      if (!offer) {
+        return c.json({ error: 'Offer not found' }, 404);
+      }
+
+      // Log sale activity (offer accepted = sale)
+      await sql`
+        INSERT INTO marketplace_activity (
+          event_type, collection_address, token_id, from_address, to_address, 
+          price_wei, tx_hash, chain, timestamp
+        ) VALUES (
+          'sale', ${offer.collection_address}, ${offer.token_id}, 
+          ${filledBy?.toLowerCase()}, ${offer.offerer}, ${offer.amount_wei},
+          ${txHash}, ${offer.chain}, NOW()
+        )
+      `;
+
+      console.log(`✅ Offer accepted: ${offer.collection_address} #${offer.token_id} for ${offer.amount_wei} wei`);
+      return c.json(offer);
+    } catch (e: any) {
+      console.error('Error filling offer:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // POST /marketplace/offers/:orderHash/cancel - Cancel offer
+  marketplace.post('/offers/:orderHash/cancel', async (c) => {
+    if (!sql) return c.json({ error: 'Database not configured' }, 500);
+
+    try {
+      const orderHash = c.req.param('orderHash').toLowerCase();
+
+      const [offer] = await sql`
+        UPDATE marketplace_offers 
+        SET status = 'cancelled'
+        WHERE order_hash = ${orderHash}
+        RETURNING *
+      `;
+
+      if (!offer) {
+        return c.json({ error: 'Offer not found' }, 404);
+      }
+
+      console.log(`❌ Cancelled offer: ${offer.collection_address} #${offer.token_id}`);
+      return c.json(offer);
+    } catch (e: any) {
+      console.error('Error cancelling offer:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // ============================================
   // COLLECTIONS API
   // ============================================
 
@@ -303,13 +521,22 @@ export function createMarketplaceRoutes(sql: Sql | null) {
           AND status = 'active' AND end_time > NOW()
       `;
 
+      // Get min bid
+      const [minBid] = await sql`
+        SELECT MIN(CAST(amount_wei AS NUMERIC)) as min_bid
+        FROM marketplace_offers
+        WHERE collection_address = ${address} AND chain = ${chain}
+          AND status = 'active' AND end_time > NOW()
+      `;
+
       return c.json({
         address,
         chain,
         token: token || null,
         stats: stats || { floor_price_wei: '0', listed_count: 0, volume_24h_wei: '0' },
         floorListing: floorListing || null,
-        listedCount: parseInt(listingCount?.count || '0')
+        listedCount: parseInt(listingCount?.count || '0'),
+        minBid: minBid?.min_bid?.toString() || null
       });
     } catch (e: any) {
       console.error('Error fetching collection:', e);
@@ -381,7 +608,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       seaportAddress: SEAPORT_ADDRESS,
       treasury: TREASURY,
       platformFeeBps: PLATFORM_FEE_BPS,
-      conduitKey: '0x0000000000000000000000000000000000000000000000000000000000000000',
+      conduitKey: '0x0000007b02230091a7ed01230072f7006a004d60a8d4e71d599b8104250f0000',
       zones: {
         base: '0x0000000000000000000000000000000000000000',
         ethereum: '0x0000000000000000000000000000000000000000'
@@ -400,10 +627,10 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         return c.json({ valid: false, error: 'Missing orderParameters or signature' }, 400);
       }
 
-      // Check offer items (should have 1 ERC721)
+      // Check offer items (should have 1 ERC721 for listing, or 1 ERC20 for bid)
       const offer = orderParameters.offer || [];
-      if (offer.length !== 1 || offer[0].itemType !== 2) {
-        return c.json({ valid: false, error: 'Invalid offer: must be single ERC721' });
+      if (offer.length !== 1) {
+        return c.json({ valid: false, error: 'Invalid offer: must have exactly 1 item' });
       }
 
       // Check consideration (should have seller payment + platform fee)
@@ -457,9 +684,16 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         WHERE chain = ${chain} AND status = 'filled' AND filled_at > NOW() - INTERVAL '24 hours'
       `;
 
+      const [offerStats] = await sql`
+        SELECT COUNT(*) as active_offers
+        FROM marketplace_offers
+        WHERE chain = ${chain} AND status = 'active' AND end_time > NOW()
+      `;
+
       return c.json({
         chain,
         activeListings: parseInt(listingStats?.active_listings || '0'),
+        activeOffers: parseInt(offerStats?.active_offers || '0'),
         totalSales: parseInt(listingStats?.total_sales || '0'),
         totalVolumeWei: listingStats?.total_volume_wei?.toString() || '0',
         volume24hWei: recentVolume?.volume_24h_wei?.toString() || '0'
@@ -520,5 +754,226 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     }
   });
 
+  // ============================================
+  // OPENSEA API PROXY
+  // ============================================
+
+  const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
+  const OPENSEA_CHAINS: Record<string, string> = {
+    ethereum: 'ethereum',
+    base: 'base',
+  };
+
+  // GET /marketplace/opensea/listings/:collection - Get listings from OpenSea
+  marketplace.get('/opensea/listings/:collection', async (c) => {
+    const collection = c.req.param('collection').toLowerCase();
+    const chain = c.req.query('chain') || 'ethereum';
+    const limit = Math.min(parseInt(c.req.query('limit') || '100'), 100);
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured', listings: {} }, 500);
+    }
+
+    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+
+    try {
+      // Use the orders/listings endpoint
+      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/listings?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`;
+
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'x-api-key': OPENSEA_API_KEY,
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`OpenSea listings error ${response.status}:`, errText);
+        return c.json({ error: `OpenSea API error: ${response.status}`, listings: {} }, response.status);
+      }
+
+      const data = await response.json();
+      
+      // Convert to a map of tokenId -> listing
+      const listings: Record<string, any> = {};
+      for (const order of data.orders || []) {
+        const params = order.protocol_data?.parameters;
+        if (params?.offer?.[0]?.identifierOrCriteria) {
+          const tokenId = params.offer[0].identifierOrCriteria;
+          listings[tokenId] = {
+            orderHash: order.order_hash,
+            price: order.price?.current?.value || '0',
+            currency: order.price?.current?.currency || 'ETH',
+            decimals: order.price?.current?.decimals || 18,
+            seller: order.maker?.address,
+            expiration: order.expiration_date,
+            protocolAddress: order.protocol_address,
+            orderData: params,
+            signature: order.protocol_data?.signature || '',
+          };
+        }
+      }
+
+      return c.json({ listings, count: Object.keys(listings).length, chain });
+    } catch (e: any) {
+      console.error('OpenSea listings fetch error:', e);
+      return c.json({ error: e.message, listings: {} }, 500);
+    }
+  });
+
+  // GET /marketplace/opensea/events/:collection - Get events/activity from OpenSea
+  marketplace.get('/opensea/events/:collection', async (c) => {
+    const collection = c.req.param('collection').toLowerCase();
+    const chain = c.req.query('chain') || 'ethereum';
+    const eventType = c.req.query('event_type'); // sale, listing, offer, cancel, transfer
+    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 50);
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured', events: [] }, 500);
+    }
+
+    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+
+    try {
+      // OpenSea events endpoint - collection slug or contract address
+      // For contract address, we use /events/chain/{chain}/contract/{address}
+      let url = `https://api.opensea.io/api/v2/events/chain/${chainSlug}/contract/${collection}?limit=${limit}`;
+      if (eventType) {
+        url += `&event_type=${eventType}`;
+      }
+
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'x-api-key': OPENSEA_API_KEY,
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`OpenSea events error ${response.status}:`, errText);
+        return c.json({ error: `OpenSea API error: ${response.status}`, events: [] }, response.status);
+      }
+
+      const data = await response.json();
+      
+      // Transform events to our format
+      const events = (data.asset_events || []).map((event: any) => ({
+        id: event.event_type + '-' + (event.order_hash || event.transaction?.transaction_hash || Math.random().toString(36)),
+        event_type: mapOpenSeaEventType(event.event_type),
+        collection_address: event.nft?.contract || collection,
+        token_id: event.nft?.identifier || null,
+        from_address: event.seller || event.from_account?.address || null,
+        to_address: event.buyer || event.to_account?.address || null,
+        price_wei: event.payment?.quantity || null,
+        tx_hash: event.transaction?.transaction_hash || null,
+        timestamp: event.event_timestamp || new Date().toISOString(),
+        block_number: event.transaction?.block_number || null,
+        image: event.nft?.image_url || null,
+        opensea_link: event.nft?.opensea_url || null,
+      }));
+
+      return c.json({ events, count: events.length, chain });
+    } catch (e: any) {
+      console.error('OpenSea events fetch error:', e);
+      return c.json({ error: e.message, events: [] }, 500);
+    }
+  });
+
+  // GET /marketplace/opensea/offers/:collection/:tokenId - Get offers for a specific NFT
+  marketplace.get('/opensea/offers/:collection/:tokenId', async (c) => {
+    const collection = c.req.param('collection').toLowerCase();
+    const tokenId = c.req.param('tokenId');
+    const chain = c.req.query('chain') || 'ethereum';
+    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50);
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured', offers: [] }, 500);
+    }
+
+    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+
+    try {
+      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenId}&order_by=eth_price&order_direction=desc&limit=${limit}`;
+
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'x-api-key': OPENSEA_API_KEY,
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error(`OpenSea offers error ${response.status}:`, errText);
+        return c.json({ error: `OpenSea API error: ${response.status}`, offers: [] }, response.status);
+      }
+
+      const data = await response.json();
+      
+      const offers = (data.orders || []).map((order: any) => ({
+        orderHash: order.order_hash,
+        price: order.price?.current?.value || '0',
+        currency: order.price?.current?.currency || 'WETH',
+        decimals: order.price?.current?.decimals || 18,
+        offerer: order.maker?.address,
+        expiration: order.expiration_date,
+        protocolAddress: order.protocol_address,
+        orderData: order.protocol_data?.parameters || null,
+        signature: order.protocol_data?.signature || '',
+      }));
+
+      return c.json({ offers, count: offers.length, tokenId, collection, chain });
+    } catch (e: any) {
+      console.error('OpenSea offers fetch error:', e);
+      return c.json({ error: e.message, offers: [] }, 500);
+    }
+  });
+
+  // GET /marketplace/opensea/collection/:slug - Get collection info by slug
+  marketplace.get('/opensea/collection/:slug', async (c) => {
+    const slug = c.req.param('slug');
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured' }, 500);
+    }
+
+    try {
+      const url = `https://api.opensea.io/api/v2/collections/${slug}`;
+
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'x-api-key': OPENSEA_API_KEY,
+        },
+      });
+
+      if (!response.ok) {
+        return c.json({ error: `OpenSea API error: ${response.status}` }, response.status);
+      }
+
+      const data = await response.json();
+      return c.json(data);
+    } catch (e: any) {
+      console.error('OpenSea collection fetch error:', e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
   return marketplace;
+}
+
+// Helper to map OpenSea event types to our types
+function mapOpenSeaEventType(osType: string): string {
+  const mapping: Record<string, string> = {
+    'sale': 'sale',
+    'order': 'listing',
+    'listing': 'listing',
+    'offer': 'offer',
+    'cancel': 'cancel',
+    'transfer': 'transfer',
+    'redemption': 'transfer',
+  };
+  return mapping[osType?.toLowerCase()] || osType?.toLowerCase() || 'unknown';
 }
