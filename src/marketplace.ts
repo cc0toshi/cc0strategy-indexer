@@ -790,7 +790,12 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       if (!response.ok) {
         const errText = await response.text();
         console.error(`OpenSea listings error ${response.status}:`, errText);
-        return c.json({ error: `OpenSea API error: ${response.status}`, listings: {} }, response.status);
+        let errorDetail = `OpenSea API error: ${response.status}`;
+        try {
+          const errJson = JSON.parse(errText);
+          errorDetail = errJson.errors?.[0] || errJson.detail || errJson.message || errorDetail;
+        } catch {}
+        return c.json({ error: errorDetail, listings: {}, debug: { url, status: response.status } }, response.status);
       }
 
       const data = await response.json();
