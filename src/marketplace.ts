@@ -823,8 +823,9 @@ export function createMarketplaceRoutes(sql: Sql | null) {
   });
 
   // GET /marketplace/opensea/events/:collection - Get events/activity from OpenSea
+  // Note: :collection can be either a slug (like "mfers") or contract address
   marketplace.get('/opensea/events/:collection', async (c) => {
-    const collection = c.req.param('collection').toLowerCase();
+    const collection = c.req.param('collection');
     const chain = c.req.query('chain') || 'ethereum';
     const eventType = c.req.query('event_type'); // sale, listing, offer, cancel, transfer
     const limit = Math.min(parseInt(c.req.query('limit') || '50'), 50);
@@ -833,12 +834,37 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       return c.json({ error: 'OpenSea API key not configured', events: [] }, 500);
     }
 
-    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
-
     try {
-      // OpenSea events endpoint - collection slug or contract address
-      // For contract address, we use /events/chain/{chain}/contract/{address}
-      let url = `https://api.opensea.io/api/v2/events/chain/${chainSlug}/contract/${collection}?limit=${limit}`;
+      // Determine if collection is a slug or contract address
+      const isContractAddress = collection.startsWith('0x') && collection.length === 42;
+      
+      let url: string;
+      if (isContractAddress) {
+        // For contract addresses, we need to first get the collection slug
+        // Or use the collection events endpoint which accepts contract addresses
+        // OpenSea API: GET /api/v2/events/collection/{collection_slug}
+        // We need to first lookup the slug from the contract
+        const contractUrl = `https://api.opensea.io/api/v2/chain/${OPENSEA_CHAINS[chain] || 'ethereum'}/contract/${collection.toLowerCase()}`;
+        const contractRes = await fetch(contractUrl, {
+          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+        });
+        
+        if (!contractRes.ok) {
+          return c.json({ error: 'Could not find collection', events: [] }, 404);
+        }
+        
+        const contractData = await contractRes.json();
+        const slug = contractData.collection;
+        if (!slug) {
+          return c.json({ error: 'Collection slug not found', events: [] }, 404);
+        }
+        
+        url = `https://api.opensea.io/api/v2/events/collection/${slug}?limit=${limit}`;
+      } else {
+        // It's already a slug
+        url = `https://api.opensea.io/api/v2/events/collection/${collection}?limit=${limit}`;
+      }
+      
       if (eventType) {
         url += `&event_type=${eventType}`;
       }
