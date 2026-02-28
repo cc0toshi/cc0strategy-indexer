@@ -820,9 +820,9 @@ app.get('/cache/all', async (c) => {
     // Get tokens from DB
     let tokens;
     if (chainFilter && validateChain(chainFilter)) {
-      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url FROM tokens WHERE chain = ${chainFilter} ORDER BY deployed_at DESC`;
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified FROM tokens WHERE chain = ${chainFilter} ORDER BY deployed_at DESC`;
     } else {
-      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url FROM tokens ORDER BY deployed_at DESC`;
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified FROM tokens ORDER BY deployed_at DESC`;
     }
     
     // Combine with cache data
@@ -843,6 +843,8 @@ app.get('/cache/all', async (c) => {
         twitterUrl: token.twitter_url,
         telegramUrl: token.telegram_url,
         discordUrl: token.discord_url,
+        deployer: token.deployer,
+        isVerified: token.is_verified || false,
         market: market ? {
           priceUsd: market.priceUsd,
           priceChange24h: market.priceChange24h,
@@ -905,6 +907,8 @@ app.get('/cache/token/:address', async (c) => {
         twitterUrl: token.twitter_url,
         telegramUrl: token.telegram_url,
         discordUrl: token.discord_url,
+        deployer: token.deployer,
+        isVerified: token.is_verified || false,
       },
       market: market || null,
       rewards: rewards || null,
