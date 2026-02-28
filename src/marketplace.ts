@@ -803,10 +803,21 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       
       // Convert to a map of tokenId -> listing
       const listings: Record<string, any> = {};
-      for (const order of data.orders || []) {
+      const orders = data.orders || [];
+      
+      // Debug: log first order structure
+      if (orders.length > 0) {
+        console.log('First order structure:', JSON.stringify(orders[0], null, 2).slice(0, 500));
+      }
+      
+      for (const order of orders) {
         const params = order.protocol_data?.parameters;
-        if (params?.offer?.[0]?.identifierOrCriteria) {
-          const tokenId = params.offer[0].identifierOrCriteria;
+        // Try multiple ways to get token ID
+        const tokenId = params?.offer?.[0]?.identifierOrCriteria || 
+                        order.maker_asset_bundle?.assets?.[0]?.token_id ||
+                        order.taker_asset_bundle?.assets?.[0]?.token_id;
+        
+        if (tokenId) {
           listings[tokenId] = {
             orderHash: order.order_hash,
             price: order.price?.current?.value || '0',
@@ -821,7 +832,12 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         }
       }
 
-      return c.json({ listings, count: Object.keys(listings).length, chain });
+      return c.json({ 
+        listings, 
+        count: Object.keys(listings).length, 
+        chain,
+        debug: { totalOrders: orders.length, parsedListings: Object.keys(listings).length }
+      });
     } catch (e: any) {
       console.error('OpenSea listings fetch error:', e);
       return c.json({ error: e.message, listings: {} }, 500);
