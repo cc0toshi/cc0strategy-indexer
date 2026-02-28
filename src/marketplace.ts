@@ -777,9 +777,20 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
 
     try {
-      // Use the orders/listings endpoint
-      // Note: order_by=eth_price only works for single token, use created_date for collections
-      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/listings?asset_contract_address=${collection}&order_by=created_date&order_direction=desc&limit=${limit}`;
+      // First get collection slug from contract address
+      const contractUrl = `https://api.opensea.io/api/v2/chain/${chainSlug}/contract/${collection}`;
+      const contractRes = await fetch(contractUrl, {
+        headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+      });
+      
+      let collectionSlug = collection;
+      if (contractRes.ok) {
+        const contractData = await contractRes.json();
+        collectionSlug = contractData.collection || collection;
+      }
+      
+      // Use the listings/collection endpoint for best listings
+      const url = `https://api.opensea.io/api/v2/listings/collection/${collectionSlug}/best?limit=${limit}`;
 
       const response = await fetch(url, {
         headers: {
@@ -803,31 +814,27 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       
       // Convert to a map of tokenId -> listing
       const listings: Record<string, any> = {};
-      const orders = data.orders || [];
       
-      // Debug: log first order structure
-      if (orders.length > 0) {
-        console.log('First order structure:', JSON.stringify(orders[0], null, 2).slice(0, 500));
-      }
+      // The /listings/collection/{slug}/best endpoint returns { listings: [...] }
+      const listingsArray = data.listings || data.orders || [];
       
-      for (const order of orders) {
-        const params = order.protocol_data?.parameters;
-        // Try multiple ways to get token ID
-        const tokenId = params?.offer?.[0]?.identifierOrCriteria || 
-                        order.maker_asset_bundle?.assets?.[0]?.token_id ||
-                        order.taker_asset_bundle?.assets?.[0]?.token_id;
+      for (const listing of listingsArray) {
+        // Get token ID from the listing
+        const tokenId = listing.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria ||
+                        listing.criteria?.trait?.token_ids?.[0] ||
+                        listing.token_id;
         
         if (tokenId) {
           listings[tokenId] = {
-            orderHash: order.order_hash,
-            price: order.price?.current?.value || '0',
-            currency: order.price?.current?.currency || 'ETH',
-            decimals: order.price?.current?.decimals || 18,
-            seller: order.maker?.address,
-            expiration: order.expiration_date,
-            protocolAddress: order.protocol_address,
-            orderData: params,
-            signature: order.protocol_data?.signature || '',
+            orderHash: listing.order_hash,
+            price: listing.price?.current?.value || '0',
+            currency: listing.price?.current?.currency || 'ETH',
+            decimals: listing.price?.current?.decimals || 18,
+            seller: listing.maker?.address || listing.offerer,
+            expiration: listing.expiration_date,
+            protocolAddress: listing.protocol_address,
+            orderData: listing.protocol_data?.parameters || null,
+            signature: listing.protocol_data?.signature || '',
           };
         }
       }
@@ -836,7 +843,8 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         listings, 
         count: Object.keys(listings).length, 
         chain,
-        debug: { totalOrders: orders.length, parsedListings: Object.keys(listings).length }
+        collectionSlug,
+        debug: { totalListings: listingsArray.length, parsedListings: Object.keys(listings).length }
       });
     } catch (e: any) {
       console.error('OpenSea listings fetch error:', e);
