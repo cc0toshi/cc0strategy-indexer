@@ -1,8 +1,10 @@
 // OpenSea Stream API WebSocket Integration
 // Docs: https://docs.opensea.io/reference/stream-api-overview
+// Using Phoenix Protocol over WebSocket
 
 import type { Server } from 'socket.io';
 import { EventEmitter } from 'events';
+import { WebSocket } from 'ws'; // Node.js WebSocket
 
 const OPENSEA_STREAM_URL = 'wss://stream.openseabeta.com/socket/websocket';
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
@@ -46,7 +48,7 @@ interface StreamEvent {
   sent_at: string;
 }
 
-// Simple WebSocket implementation using native WebSocket
+// WebSocket connection
 let ws: WebSocket | null = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -71,7 +73,7 @@ function connect() {
   try {
     ws = new WebSocket(`${OPENSEA_STREAM_URL}?token=${OPENSEA_API_KEY}`);
 
-    ws.onopen = () => {
+    ws.on('open', () => {
       console.log('🔌 Connected to OpenSea Stream API');
       reconnectAttempts = 0;
       
@@ -79,11 +81,11 @@ function connect() {
       for (const collection of subscribedCollections) {
         subscribeToCollection(collection);
       }
-    };
+    });
 
-    ws.onmessage = (event) => {
+    ws.on('message', (rawData: Buffer | string) => {
       try {
-        const data = JSON.parse(event.data.toString());
+        const data = JSON.parse(rawData.toString());
         
         // Handle Phoenix channel responses
         if (data.event === 'phx_reply') {
@@ -110,16 +112,16 @@ function connect() {
       } catch (e) {
         console.error('Error parsing OpenSea event:', e);
       }
-    };
+    });
 
-    ws.onerror = (error) => {
+    ws.on('error', (error) => {
       console.error('OpenSea WebSocket error:', error);
-    };
+    });
 
-    ws.onclose = () => {
+    ws.on('close', () => {
       console.log('🔌 OpenSea WebSocket disconnected');
       attemptReconnect();
-    };
+    });
   } catch (e) {
     console.error('Failed to connect to OpenSea Stream:', e);
     attemptReconnect();
@@ -137,7 +139,7 @@ function attemptReconnect() {
 }
 
 function sendHeartbeat(ref: string) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify({
       topic: 'phoenix',
       event: 'heartbeat',
@@ -152,7 +154,7 @@ let messageRef = 0;
 export function subscribeToCollection(collectionSlug: string) {
   subscribedCollections.add(collectionSlug);
   
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === 1) { // 1 = OPEN
     messageRef++;
     const message = {
       topic: `collection:${collectionSlug}`,
@@ -169,7 +171,7 @@ export function subscribeToCollection(collectionSlug: string) {
 export function unsubscribeFromCollection(collectionSlug: string) {
   subscribedCollections.delete(collectionSlug);
   
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === 1) { // 1 = OPEN
     messageRef++;
     const message = {
       topic: `collection:${collectionSlug}`,
@@ -269,8 +271,9 @@ export function initOpenSeaStream() {
 // Get connection status
 export function getStreamStatus() {
   return {
-    connected: ws?.readyState === WebSocket.OPEN,
+    connected: ws?.readyState === 1, // 1 = OPEN
     subscribedCollections: Array.from(subscribedCollections),
     reconnectAttempts,
+    apiKeyConfigured: !!OPENSEA_API_KEY,
   };
 }
