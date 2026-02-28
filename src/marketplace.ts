@@ -128,6 +128,31 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         return c.json({ error: 'Missing required fields' }, 400);
       }
 
+      // Validate platform fee in order data
+      const orderParams = orderData.parameters || orderData;
+      const consideration = orderParams.consideration || [];
+      const platformFeeItem = consideration.find((c: any) => 
+        c.recipient?.toLowerCase() === TREASURY.toLowerCase()
+      );
+      
+      if (!platformFeeItem) {
+        return c.json({ error: `Platform fee required. Fee must go to: ${TREASURY}` }, 400);
+      }
+      
+      // Verify 1% fee
+      const feeAmount = BigInt(platformFeeItem.startAmount || '0');
+      const totalPrice = BigInt(priceWei);
+      const expectedFee = totalPrice / 100n;
+      const tolerance = totalPrice / 10000n; // 0.01% tolerance
+      
+      if (feeAmount < expectedFee - tolerance) {
+        return c.json({ 
+          error: `Insufficient platform fee. Expected 1% (${expectedFee.toString()}), got ${feeAmount.toString()}`
+        }, 400);
+      }
+      
+      console.log(`✅ Listing validated: ${collectionAddress} #${tokenId}, price: ${priceWei}, fee: ${feeAmount.toString()}`);
+
       const [listing] = await sql`
         INSERT INTO marketplace_listings (
           order_hash, order_data, collection_address, token_id, seller,
@@ -339,6 +364,32 @@ export function createMarketplaceRoutes(sql: Sql | null) {
 
       if (!collectionAddress || !tokenId || !offerer || !amountWei || !endTime) {
         return c.json({ error: 'Missing required fields' }, 400);
+      }
+
+      // Validate platform fee in order data
+      if (orderData) {
+        const consideration = orderData.consideration || [];
+        const platformFeeItem = consideration.find((c: any) => 
+          c.recipient?.toLowerCase() === TREASURY.toLowerCase()
+        );
+        
+        if (!platformFeeItem) {
+          return c.json({ error: `Platform fee required. Fee must go to: ${TREASURY}` }, 400);
+        }
+        
+        // Verify 1% fee based on offer amount
+        const feeAmount = BigInt(platformFeeItem.startAmount || '0');
+        const offerAmount = BigInt(amountWei);
+        const expectedFee = offerAmount / 100n;
+        const tolerance = offerAmount / 10000n; // 0.01% tolerance
+        
+        if (feeAmount < expectedFee - tolerance) {
+          return c.json({ 
+            error: `Insufficient platform fee. Expected 1% (${expectedFee.toString()}), got ${feeAmount.toString()}`
+          }, 400);
+        }
+        
+        console.log(`✅ Offer validated: ${collectionAddress} #${tokenId}, amount: ${amountWei}, fee: ${feeAmount.toString()}`);
       }
 
       // Generate order hash from order data or create one
@@ -620,7 +671,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
   marketplace.post('/seaport/validate-order', async (c) => {
     try {
       const body = await c.req.json();
-      const { orderParameters, signature } = body;
+      const { orderParameters, signature, orderType = 'listing' } = body;
 
       // Basic validation
       if (!orderParameters || !signature) {
@@ -636,20 +687,62 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       // Check consideration (should have seller payment + platform fee)
       const consideration = orderParameters.consideration || [];
       if (consideration.length < 2) {
-        return c.json({ valid: false, error: 'Missing platform fee in consideration' });
+        return c.json({ valid: false, error: 'Missing platform fee in consideration. Orders must include 1% platform fee.' });
       }
 
       // Check platform fee recipient
-      const platformFee = consideration.find((c: any) => 
+      const platformFeeItem = consideration.find((c: any) => 
         c.recipient?.toLowerCase() === TREASURY.toLowerCase()
       );
-      if (!platformFee) {
-        return c.json({ valid: false, error: 'Platform fee must go to treasury' });
+      if (!platformFeeItem) {
+        return c.json({ valid: false, error: `Platform fee must go to treasury: ${TREASURY}` });
+      }
+
+      // Validate 1% platform fee amount
+      // For listings: offer[0] is NFT, consideration[0] is seller payment, consideration[1] is fee
+      // For offers: offer[0] is WETH, consideration[0] is NFT, consideration[1] is fee
+      const feeAmount = BigInt(platformFeeItem.startAmount || '0');
+      
+      if (orderType === 'listing') {
+        // For listings, total price = sellerReceives + platformFee
+        const sellerItem = consideration.find((c: any) => 
+          c.recipient?.toLowerCase() !== TREASURY.toLowerCase() && 
+          (c.itemType === 0 || c.itemType === 1) // ETH or ERC20
+        );
+        if (sellerItem) {
+          const sellerAmount = BigInt(sellerItem.startAmount || '0');
+          const totalPrice = sellerAmount + feeAmount;
+          const expectedFee = totalPrice / 100n; // 1%
+          
+          // Allow small rounding tolerance (within 0.01% of total)
+          const tolerance = totalPrice / 10000n;
+          if (feeAmount < expectedFee - tolerance || feeAmount > expectedFee + tolerance) {
+            return c.json({ 
+              valid: false, 
+              error: `Platform fee must be exactly 1%. Expected: ${expectedFee.toString()}, Got: ${feeAmount.toString()}`
+            });
+          }
+        }
+      } else if (orderType === 'offer') {
+        // For offers, offer amount is the WETH being offered
+        const offerAmount = BigInt(offer[0]?.startAmount || '0');
+        const expectedFee = offerAmount / 100n; // 1%
+        
+        const tolerance = offerAmount / 10000n;
+        if (feeAmount < expectedFee - tolerance || feeAmount > expectedFee + tolerance) {
+          return c.json({ 
+            valid: false, 
+            error: `Platform fee must be exactly 1%. Expected: ${expectedFee.toString()}, Got: ${feeAmount.toString()}`
+          });
+        }
       }
 
       return c.json({ 
         valid: true,
         seaportAddress: SEAPORT_ADDRESS,
+        treasury: TREASURY,
+        platformFeeBps: PLATFORM_FEE_BPS,
+        feeAmount: feeAmount.toString(),
         orderHash: orderParameters.orderHash || null
       });
     } catch (e: any) {
@@ -915,20 +1008,33 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       const data = await response.json();
       
       // Transform events to our format
-      const events = (data.asset_events || []).map((event: any) => ({
-        id: event.event_type + '-' + (event.order_hash || event.transaction?.transaction_hash || Math.random().toString(36)),
-        event_type: mapOpenSeaEventType(event.event_type),
-        collection_address: event.nft?.contract || collection,
-        token_id: event.nft?.identifier || null,
-        from_address: event.seller || event.from_account?.address || null,
-        to_address: event.buyer || event.to_account?.address || null,
-        price_wei: event.payment?.quantity || null,
-        tx_hash: event.transaction?.transaction_hash || null,
-        timestamp: event.event_timestamp || new Date().toISOString(),
-        block_number: event.transaction?.block_number || null,
-        image: event.nft?.image_url || null,
-        opensea_link: event.nft?.opensea_url || null,
-      }));
+      const events = (data.asset_events || []).map((event: any) => {
+        // For listings/orders, token_id may be in order data, not in nft object
+        let tokenId = event.nft?.identifier || null;
+        if (!tokenId && event.order) {
+          // Try to get from order's offer items
+          tokenId = event.order.protocol_data?.parameters?.offer?.[0]?.identifierOrCriteria || 
+                    event.order.maker_asset_bundle?.assets?.[0]?.token_id || null;
+        }
+        if (!tokenId && event.criteria) {
+          tokenId = event.criteria.trait?.token_ids?.[0] || null;
+        }
+        
+        return {
+          id: event.event_type + '-' + (event.order_hash || event.transaction?.transaction_hash || Math.random().toString(36)),
+          event_type: mapOpenSeaEventType(event.event_type),
+          collection_address: event.nft?.contract || collection,
+          token_id: tokenId,
+          from_address: event.seller || event.maker || event.from_account?.address || null,
+          to_address: event.buyer || event.taker || event.to_account?.address || null,
+          price_wei: event.payment?.quantity || event.base_price || null,
+          tx_hash: event.transaction?.transaction_hash || null,
+          timestamp: event.event_timestamp || new Date().toISOString(),
+          block_number: event.transaction?.block_number || null,
+          image: event.nft?.image_url || null,
+          opensea_link: event.nft?.opensea_url || null,
+        };
+      });
 
       return c.json({ events, count: events.length, chain });
     } catch (e: any) {
@@ -1021,7 +1127,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
   marketplace.get('/opensea/collection-offers/:collection', async (c) => {
     const collection = c.req.param('collection').toLowerCase();
     const chain = c.req.query('chain') || 'ethereum';
-    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50);
+    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
 
     if (!OPENSEA_API_KEY) {
       return c.json({ error: 'OpenSea API key not configured', offers: [], minBid: null }, 500);
@@ -1030,46 +1136,206 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
 
     try {
-      // Get collection offers (bids on collection trait, not specific NFTs)
-      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`;
-
-      const response = await fetch(url, {
-        headers: {
-          'accept': 'application/json',
-          'x-api-key': OPENSEA_API_KEY,
-        },
+      // First get collection slug from contract address
+      const contractUrl = `https://api.opensea.io/api/v2/chain/${chainSlug}/contract/${collection}`;
+      const contractRes = await fetch(contractUrl, {
+        headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
       });
-
-      if (!response.ok) {
-        // If offers endpoint fails, return empty
-        return c.json({ offers: [], minBid: null, chain });
+      
+      let collectionSlug = collection;
+      if (contractRes.ok) {
+        const contractData = await contractRes.json();
+        collectionSlug = contractData.collection || collection;
       }
 
-      const data = await response.json();
-      
-      const offers = (data.orders || []).map((order: any) => ({
-        orderHash: order.order_hash,
-        price: order.price?.current?.value || '0',
-        currency: order.price?.current?.currency || 'WETH',
-        decimals: order.price?.current?.decimals || 18,
-        offerer: order.maker?.address,
-        tokenId: order.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria || null,
-        expiration: order.expiration_date,
-      }));
+      // Fetch both collection-wide offers AND item-specific offers
+      const [collectionOffersRes, itemOffersRes] = await Promise.all([
+        // Collection offers endpoint (offers that apply to any NFT in collection)
+        fetch(`https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`, {
+          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+        }),
+        // Item-specific offers (for fallback)
+        fetch(`https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`, {
+          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+        }),
+      ]);
 
-      // Get min bid (lowest offer - list is already sorted asc)
-      const minBid = offers.length > 0 ? offers[0].price : null;
+      const allOffers: any[] = [];
+
+      // Parse collection-wide offers
+      if (collectionOffersRes.ok) {
+        const collectionData = await collectionOffersRes.json();
+        const collectionOffers = collectionData.offers || [];
+        
+        for (const order of collectionOffers) {
+          allOffers.push({
+            orderHash: order.order_hash,
+            price: order.price?.current?.value || order.price?.value || '0',
+            currency: order.price?.current?.currency || order.price?.currency || 'WETH',
+            decimals: order.price?.current?.decimals || 18,
+            offerer: order.maker?.address || order.protocol_data?.parameters?.offerer,
+            tokenId: null, // Collection offer - applies to any NFT
+            expiration: order.expiration_date,
+            isCollectionOffer: true,
+          });
+        }
+      }
+
+      // Parse item-specific offers
+      if (itemOffersRes.ok) {
+        const itemData = await itemOffersRes.json();
+        const itemOrders = itemData.orders || [];
+        
+        for (const order of itemOrders) {
+          allOffers.push({
+            orderHash: order.order_hash,
+            price: order.price?.current?.value || '0',
+            currency: order.price?.current?.currency || 'WETH',
+            decimals: order.price?.current?.decimals || 18,
+            offerer: order.maker?.address,
+            tokenId: order.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria || null,
+            expiration: order.expiration_date,
+            isCollectionOffer: false,
+          });
+        }
+      }
+
+      // Sort all offers by price (low to high) and get minBid
+      allOffers.sort((a, b) => {
+        const priceA = BigInt(a.price || '0');
+        const priceB = BigInt(b.price || '0');
+        return priceA < priceB ? -1 : priceA > priceB ? 1 : 0;
+      });
+
+      // Get min bid (lowest offer)
+      const minBid = allOffers.length > 0 ? allOffers[0].price : null;
 
       return c.json({ 
-        offers, 
-        count: offers.length, 
+        offers: allOffers, 
+        count: allOffers.length, 
         minBid,
         collection, 
-        chain 
+        collectionSlug,
+        chain,
       });
     } catch (e: any) {
       console.error('OpenSea collection offers fetch error:', e);
       return c.json({ error: e.message, offers: [], minBid: null }, 500);
+    }
+  });
+
+  // GET /marketplace/opensea/nft-offers-batch - Get best offer for multiple NFTs at once
+  marketplace.get('/opensea/nft-offers-batch', async (c) => {
+    const collection = c.req.query('collection')?.toLowerCase();
+    const tokenIds = c.req.query('tokenIds')?.split(',') || [];
+    const chain = c.req.query('chain') || 'ethereum';
+
+    if (!collection || tokenIds.length === 0) {
+      return c.json({ error: 'Missing collection or tokenIds', offers: {} }, 400);
+    }
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured', offers: {} }, 500);
+    }
+
+    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+    const offers: Record<string, any> = {};
+
+    try {
+      // First get collection slug for collection offers
+      const contractUrl = `https://api.opensea.io/api/v2/chain/${chainSlug}/contract/${collection}`;
+      const contractRes = await fetch(contractUrl, {
+        headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+      });
+      
+      let collectionSlug = collection;
+      let collectionOffer: any = null;
+
+      if (contractRes.ok) {
+        const contractData = await contractRes.json();
+        collectionSlug = contractData.collection || collection;
+        
+        // Get collection-wide best offer
+        const collOffersRes = await fetch(
+          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=1`,
+          { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
+        );
+        
+        if (collOffersRes.ok) {
+          const collData = await collOffersRes.json();
+          if (collData.offers?.[0]) {
+            const offer = collData.offers[0];
+            collectionOffer = {
+              orderHash: offer.order_hash,
+              price: offer.price?.current?.value || offer.price?.value || '0',
+              currency: offer.price?.current?.currency || 'WETH',
+              decimals: offer.price?.current?.decimals || 18,
+              offerer: offer.maker?.address,
+              isCollectionOffer: true,
+            };
+          }
+        }
+      }
+
+      // Batch fetch item-specific offers (max 30 tokenIds per request)
+      const batchSize = 30;
+      for (let i = 0; i < tokenIds.length; i += batchSize) {
+        const batch = tokenIds.slice(i, i + batchSize);
+        const tokenIdsParam = batch.join(',');
+        
+        const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenIdsParam}&order_by=eth_price&order_direction=desc&limit=100`;
+        
+        const response = await fetch(url, {
+          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          
+          // Group offers by tokenId and get best for each
+          for (const order of (data.orders || [])) {
+            const tokenId = order.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria;
+            if (!tokenId) continue;
+
+            const offerData = {
+              orderHash: order.order_hash,
+              price: order.price?.current?.value || '0',
+              currency: order.price?.current?.currency || 'WETH',
+              decimals: order.price?.current?.decimals || 18,
+              offerer: order.maker?.address,
+              isCollectionOffer: false,
+            };
+
+            // Keep best (highest) offer for each tokenId
+            if (!offers[tokenId] || BigInt(offerData.price) > BigInt(offers[tokenId].price)) {
+              offers[tokenId] = offerData;
+            }
+          }
+        }
+      }
+
+      // For any NFT without item-specific offer, use collection offer if available
+      if (collectionOffer) {
+        for (const tokenId of tokenIds) {
+          if (!offers[tokenId]) {
+            offers[tokenId] = { ...collectionOffer, tokenId };
+          } else if (BigInt(collectionOffer.price) > BigInt(offers[tokenId].price)) {
+            // Collection offer is better
+            offers[tokenId] = { ...collectionOffer, tokenId };
+          }
+        }
+      }
+
+      return c.json({ 
+        offers, 
+        count: Object.keys(offers).length, 
+        collection, 
+        chain,
+        collectionOffer,
+      });
+    } catch (e: any) {
+      console.error('OpenSea batch offers fetch error:', e);
+      return c.json({ error: e.message, offers: {} }, 500);
     }
   });
 
