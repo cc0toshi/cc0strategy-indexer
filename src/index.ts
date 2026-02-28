@@ -17,6 +17,7 @@ import {
   validateChain 
 } from './config.js';
 import { createMarketplaceRoutes } from './marketplace.js';
+import { initOpenSeaStream, setSocketIoServer, subscribeToCollection, unsubscribeFromCollection, getStreamStatus, onEvent } from './opensea-stream.js';
 
 // ============================================
 // CACHE CONFIGURATION
@@ -952,6 +953,25 @@ app.get('/cache/status', (c) => {
   });
 });
 
+// GET /stream/status - OpenSea Stream API status
+app.get('/stream/status', (c) => {
+  return c.json(getStreamStatus());
+});
+
+// POST /stream/subscribe/:collection - Subscribe to collection events
+app.post('/stream/subscribe/:collection', (c) => {
+  const collection = c.req.param('collection');
+  subscribeToCollection(collection);
+  return c.json({ success: true, collection, status: getStreamStatus() });
+});
+
+// POST /stream/unsubscribe/:collection - Unsubscribe from collection events
+app.post('/stream/unsubscribe/:collection', (c) => {
+  const collection = c.req.param('collection');
+  unsubscribeFromCollection(collection);
+  return c.json({ success: true, collection, status: getStreamStatus() });
+});
+
 // GET /config - Return chain configurations (public info only)
 app.get('/config', (c) => {
   const publicConfig = Object.fromEntries(
@@ -1152,9 +1172,49 @@ io = new SocketIOServer(httpServer, {
 io.on('connection', (socket) => {
   console.log(`🔌 Client connected: ${socket.id}`);
   
+  // Join 'all' room by default for global events
+  socket.join('all');
+  
+  // Subscribe to a collection for real-time updates
+  socket.on('subscribe:collection', (collectionSlug: string) => {
+    console.log(`📡 ${socket.id} subscribed to collection: ${collectionSlug}`);
+    socket.join(collectionSlug);
+    
+    // Subscribe to OpenSea stream for this collection
+    subscribeToCollection(collectionSlug);
+  });
+  
+  // Unsubscribe from a collection
+  socket.on('unsubscribe:collection', (collectionSlug: string) => {
+    console.log(`📴 ${socket.id} unsubscribed from collection: ${collectionSlug}`);
+    socket.leave(collectionSlug);
+    
+    // Check if any other clients are in this room
+    const room = io?.sockets.adapter.rooms.get(collectionSlug);
+    if (!room || room.size === 0) {
+      unsubscribeFromCollection(collectionSlug);
+    }
+  });
+  
+  // Get stream status
+  socket.on('stream:status', (callback: (status: any) => void) => {
+    callback(getStreamStatus());
+  });
+  
   socket.on('disconnect', () => {
     console.log(`🔌 Client disconnected: ${socket.id}`);
   });
+});
+
+// Set Socket.IO server for OpenSea stream to broadcast events
+setSocketIoServer(io);
+
+// Initialize OpenSea Stream API
+initOpenSeaStream();
+
+// Log OpenSea events
+onEvent((event) => {
+  console.log(`📨 OpenSea event: ${event.event_type} - ${event.collection_slug || event.collection_address} #${event.token_id}`);
 });
 
 // Start the server
