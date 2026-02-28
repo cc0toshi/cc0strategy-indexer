@@ -18,6 +18,12 @@ export interface Token {
   imageUrl?: string;
   websiteUrl?: string;
   twitterUrl?: string;
+  // Verification fields
+  isVerified: boolean;
+  deployerEmail?: string;
+  deployerTwitter?: string;
+  deployerWebsite?: string;
+  verifiedAt?: Date;
 }
 
 export interface Swap {
