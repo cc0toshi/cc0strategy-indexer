@@ -1385,6 +1385,92 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       }
 
       const data = await response.json();
+      
+      // Extract transaction data and encode calldata
+      const tx = data.fulfillment_data?.transaction;
+      if (tx && tx.input_data?.parameters) {
+        const params = tx.input_data.parameters;
+        
+        // Encode the fulfillBasicOrder_efficient_6GL6yc call
+        const { encodeFunctionData } = await import('viem');
+        
+        // Seaport 1.6 ABI for fulfillBasicOrder_efficient_6GL6yc
+        const seaportAbi = [{
+          name: 'fulfillBasicOrder_efficient_6GL6yc',
+          type: 'function',
+          inputs: [{
+            name: 'parameters',
+            type: 'tuple',
+            components: [
+              { name: 'considerationToken', type: 'address' },
+              { name: 'considerationIdentifier', type: 'uint256' },
+              { name: 'considerationAmount', type: 'uint256' },
+              { name: 'offerer', type: 'address' },
+              { name: 'zone', type: 'address' },
+              { name: 'offerToken', type: 'address' },
+              { name: 'offerIdentifier', type: 'uint256' },
+              { name: 'offerAmount', type: 'uint256' },
+              { name: 'basicOrderType', type: 'uint8' },
+              { name: 'startTime', type: 'uint256' },
+              { name: 'endTime', type: 'uint256' },
+              { name: 'zoneHash', type: 'bytes32' },
+              { name: 'salt', type: 'uint256' },
+              { name: 'offererConduitKey', type: 'bytes32' },
+              { name: 'fulfillerConduitKey', type: 'bytes32' },
+              { name: 'totalOriginalAdditionalRecipients', type: 'uint256' },
+              { name: 'additionalRecipients', type: 'tuple[]', components: [
+                { name: 'amount', type: 'uint256' },
+                { name: 'recipient', type: 'address' }
+              ]},
+              { name: 'signature', type: 'bytes' }
+            ]
+          }],
+          outputs: [{ name: '', type: 'bool' }]
+        }] as const;
+
+        // Format parameters for encoding
+        const formattedParams = {
+          considerationToken: params.considerationToken as `0x${string}`,
+          considerationIdentifier: BigInt(params.considerationIdentifier || '0'),
+          considerationAmount: BigInt(params.considerationAmount || '0'),
+          offerer: params.offerer as `0x${string}`,
+          zone: params.zone as `0x${string}`,
+          offerToken: params.offerToken as `0x${string}`,
+          offerIdentifier: BigInt(params.offerIdentifier || '0'),
+          offerAmount: BigInt(params.offerAmount || '1'),
+          basicOrderType: Number(params.basicOrderType || 0),
+          startTime: BigInt(params.startTime || '0'),
+          endTime: BigInt(params.endTime || '0'),
+          zoneHash: params.zoneHash as `0x${string}`,
+          salt: BigInt(params.salt || '0'),
+          offererConduitKey: params.offererConduitKey as `0x${string}`,
+          fulfillerConduitKey: params.fulfillerConduitKey as `0x${string}`,
+          totalOriginalAdditionalRecipients: BigInt(params.totalOriginalAdditionalRecipients || '0'),
+          additionalRecipients: (params.additionalRecipients || []).map((r: any) => ({
+            amount: BigInt(r.amount || '0'),
+            recipient: r.recipient as `0x${string}`
+          })),
+          signature: params.signature as `0x${string}`
+        };
+
+        const calldata = encodeFunctionData({
+          abi: seaportAbi,
+          functionName: 'fulfillBasicOrder_efficient_6GL6yc',
+          args: [formattedParams]
+        });
+
+        // Return transaction with encoded calldata
+        return c.json({
+          transaction: {
+            to: tx.to,
+            value: tx.value,
+            data: calldata,
+          },
+          fulfillment_data: data.fulfillment_data,
+        });
+      }
+
+      // Fallback: return raw OpenSea response
       return c.json(data);
     } catch (e: any) {
       console.error("Fulfill error:", e);
