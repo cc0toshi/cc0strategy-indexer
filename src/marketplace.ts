@@ -778,7 +778,8 @@ export function createMarketplaceRoutes(sql: Sql | null) {
 
     try {
       // Use the orders/listings endpoint
-      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/listings?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`;
+      // Note: order_by=eth_price only works for single token, use created_date for collections
+      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/listings?asset_contract_address=${collection}&order_by=created_date&order_direction=desc&limit=${limit}`;
 
       const response = await fetch(url, {
         headers: {
