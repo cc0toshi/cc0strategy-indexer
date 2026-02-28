@@ -1017,19 +1017,85 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     }
   });
 
+  // GET /marketplace/opensea/collection-offers/:collection - Get collection offers for minBid
+  marketplace.get('/opensea/collection-offers/:collection', async (c) => {
+    const collection = c.req.param('collection').toLowerCase();
+    const chain = c.req.query('chain') || 'ethereum';
+    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50);
+
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: 'OpenSea API key not configured', offers: [], minBid: null }, 500);
+    }
+
+    const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+
+    try {
+      // Get collection offers (bids on collection trait, not specific NFTs)
+      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`;
+
+      const response = await fetch(url, {
+        headers: {
+          'accept': 'application/json',
+          'x-api-key': OPENSEA_API_KEY,
+        },
+      });
+
+      if (!response.ok) {
+        // If offers endpoint fails, return empty
+        return c.json({ offers: [], minBid: null, chain });
+      }
+
+      const data = await response.json();
+      
+      const offers = (data.orders || []).map((order: any) => ({
+        orderHash: order.order_hash,
+        price: order.price?.current?.value || '0',
+        currency: order.price?.current?.currency || 'WETH',
+        decimals: order.price?.current?.decimals || 18,
+        offerer: order.maker?.address,
+        tokenId: order.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria || null,
+        expiration: order.expiration_date,
+      }));
+
+      // Get min bid (lowest offer - list is already sorted asc)
+      const minBid = offers.length > 0 ? offers[0].price : null;
+
+      return c.json({ 
+        offers, 
+        count: offers.length, 
+        minBid,
+        collection, 
+        chain 
+      });
+    } catch (e: any) {
+      console.error('OpenSea collection offers fetch error:', e);
+      return c.json({ error: e.message, offers: [], minBid: null }, 500);
+    }
+  });
+
   return marketplace;
 }
 
 // Helper to map OpenSea event types to our types
 function mapOpenSeaEventType(osType: string): string {
+  const typeStr = osType?.toLowerCase() || 'unknown';
   const mapping: Record<string, string> = {
     'sale': 'sale',
+    'successful': 'sale',  // OpenSea uses 'successful' for completed sales
     'order': 'listing',
     'listing': 'listing',
+    'created': 'listing',  // order_created
     'offer': 'offer',
+    'offer_entered': 'offer',
+    'bid_entered': 'offer',
+    'bid': 'offer',
+    'collection_offer': 'offer',
     'cancel': 'cancel',
+    'cancelled': 'cancel',
+    'order_cancelled': 'cancel',
     'transfer': 'transfer',
     'redemption': 'transfer',
+    'mint': 'transfer',
   };
-  return mapping[osType?.toLowerCase()] || osType?.toLowerCase() || 'unknown';
+  return mapping[typeStr] || typeStr;
 }
