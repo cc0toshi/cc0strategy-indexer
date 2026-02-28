@@ -18,7 +18,8 @@
     "socket.io": "^4.7.4",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
-    "viem": "^2.22.13"
+    "viem": "^2.22.13",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@railway/cli": "^4.30.3",
