@@ -1339,6 +1339,59 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     }
   });
 
+
+  // POST /marketplace/opensea/fulfill - Get fulfillment data for a listing
+  marketplace.post("/opensea/fulfill", async (c) => {
+    const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: "OpenSea API key not configured" }, 500);
+    }
+
+    try {
+      const body = await c.req.json();
+      const { orderHash, chain, fulfiller, protocolAddress } = body;
+
+      if (!orderHash || !fulfiller) {
+        return c.json({ error: "Missing orderHash or fulfiller" }, 400);
+      }
+
+      const chainSlug = chain === "ethereum" ? "ethereum" : "base";
+
+      // Call OpenSea Fulfillment API
+      const url = "https://api.opensea.io/api/v2/listings/fulfillment_data";
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "accept": "application/json",
+          "content-type": "application/json",
+          "x-api-key": OPENSEA_API_KEY,
+        },
+        body: JSON.stringify({
+          listing: {
+            hash: orderHash,
+            chain: chainSlug,
+            protocol_address: protocolAddress || "0x0000000000000068F116a894984e2DB1123eB395",
+          },
+          fulfiller: {
+            address: fulfiller,
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("OpenSea fulfill error:", errText);
+        return c.json({ error: "OpenSea API error", details: errText }, response.status);
+      }
+
+      const data = await response.json();
+      return c.json(data);
+    } catch (e: any) {
+      console.error("Fulfill error:", e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
   return marketplace;
 }
 

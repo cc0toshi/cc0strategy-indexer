@@ -4,7 +4,7 @@
 
 import type { Server } from 'socket.io';
 import { EventEmitter } from 'events';
-import { WebSocket } from 'ws'; // Node.js WebSocket
+import WebSocket from 'ws'; // Node.js WebSocket (default import for ESM)
 
 const OPENSEA_STREAM_URL = 'wss://stream.openseabeta.com/socket/websocket';
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
@@ -51,8 +51,13 @@ interface StreamEvent {
 // WebSocket connection
 let ws: WebSocket | null = null;
 let reconnectAttempts = 0;
-const MAX_RECONNECT_ATTEMPTS = 10;
-const RECONNECT_DELAY = 5000;
+const MAX_RECONNECT_ATTEMPTS = 15;
+const BASE_RECONNECT_DELAY = 1000; // Start with 1 second
+const MAX_RECONNECT_DELAY = 60000; // Max 60 seconds
+
+// Heartbeat/ping interval to keep connection alive
+let heartbeatInterval: NodeJS.Timeout | null = null;
+const HEARTBEAT_INTERVAL = 30000; // Send ping every 30 seconds
 
 const eventEmitter = new EventEmitter();
 const subscribedCollections = new Set<string>();
@@ -64,22 +69,84 @@ export function setSocketIoServer(io: Server) {
   socketIoServer = io;
 }
 
+// Calculate exponential backoff delay
+function getReconnectDelay(): number {
+  // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s (capped)
+  const delay = Math.min(
+    BASE_RECONNECT_DELAY * Math.pow(2, reconnectAttempts),
+    MAX_RECONNECT_DELAY
+  );
+  // Add jitter (±20%) to prevent thundering herd
+  const jitter = delay * 0.2 * (Math.random() - 0.5);
+  return Math.floor(delay + jitter);
+}
+
+// Start heartbeat ping to keep connection alive
+function startHeartbeat() {
+  stopHeartbeat();
+  heartbeatInterval = setInterval(() => {
+    if (ws && ws.readyState === 1) { // OPEN
+      messageRef++;
+      const pingMessage = {
+        topic: 'phoenix',
+        event: 'heartbeat',
+        payload: {},
+        ref: messageRef.toString(),
+      };
+      try {
+        ws.send(JSON.stringify(pingMessage));
+        console.log('💓 OpenSea Stream heartbeat sent');
+      } catch (e) {
+        console.error('Failed to send heartbeat:', e);
+      }
+    }
+  }, HEARTBEAT_INTERVAL);
+}
+
+function stopHeartbeat() {
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+}
+
 function connect() {
   if (!OPENSEA_API_KEY) {
     console.log('⚠️ OpenSea API key not configured, WebSocket disabled');
     return;
   }
 
+  // Clean up any existing connection
+  if (ws) {
+    try {
+      ws.removeAllListeners();
+      ws.close();
+    } catch (e) {
+      // Ignore cleanup errors
+    }
+    ws = null;
+  }
+  stopHeartbeat();
+
   try {
+    console.log('🔄 Connecting to OpenSea Stream API...');
     ws = new WebSocket(`${OPENSEA_STREAM_URL}?token=${OPENSEA_API_KEY}`);
 
     ws.on('open', () => {
       console.log('🔌 Connected to OpenSea Stream API');
       reconnectAttempts = 0;
       
+      // Start heartbeat to keep connection alive
+      startHeartbeat();
+      
       // Re-subscribe to all collections
-      for (const collection of subscribedCollections) {
-        subscribeToCollection(collection);
+      const collectionsToRestore = Array.from(subscribedCollections);
+      if (collectionsToRestore.length > 0) {
+        console.log(`🔄 Restoring ${collectionsToRestore.length} subscription(s)...`);
+        for (const collection of collectionsToRestore) {
+          subscribeToCollection(collection);
+        }
+        console.log(`✅ Restored subscriptions: ${collectionsToRestore.join(', ')}`);
       }
     });
 
@@ -91,13 +158,15 @@ function connect() {
         if (data.event === 'phx_reply') {
           if (data.payload?.status === 'ok') {
             console.log(`✅ Subscription confirmed for topic: ${data.topic}`);
+          } else if (data.payload?.status === 'error') {
+            console.error(`❌ Subscription failed for topic: ${data.topic}`, data.payload?.response);
           }
           return;
         }
 
-        // Handle heartbeat
-        if (data.event === 'heartbeat') {
-          sendHeartbeat(data.ref);
+        // Handle heartbeat response
+        if (data.event === 'heartbeat' || data.event === 'phx_reply' && data.topic === 'phoenix') {
+          // Heartbeat acknowledged
           return;
         }
 
@@ -114,12 +183,22 @@ function connect() {
       }
     });
 
-    ws.on('error', (error) => {
-      console.error('OpenSea WebSocket error:', error);
+    ws.on('error', (error: any) => {
+      const errorCode = error?.code || error?.message || 'unknown';
+      console.error(`OpenSea WebSocket error (${errorCode}):`, error.message || error);
     });
 
-    ws.on('close', () => {
-      console.log('🔌 OpenSea WebSocket disconnected');
+    ws.on('close', (code: number, reason: Buffer) => {
+      const reasonStr = reason?.toString() || 'no reason';
+      console.log(`🔌 OpenSea WebSocket disconnected (code: ${code}, reason: ${reasonStr})`);
+      stopHeartbeat();
+      attemptReconnect();
+    });
+
+    // Handle unexpected errors
+    ws.on('unexpected-response', (req: any, res: any) => {
+      console.error(`OpenSea WebSocket unexpected response: ${res.statusCode}`);
+      stopHeartbeat();
       attemptReconnect();
     });
   } catch (e) {
@@ -131,15 +210,22 @@ function connect() {
 function attemptReconnect() {
   if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
     reconnectAttempts++;
-    console.log(`Reconnecting to OpenSea Stream (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
-    setTimeout(connect, RECONNECT_DELAY * reconnectAttempts);
+    const delay = getReconnectDelay();
+    console.log(`🔄 Reconnecting to OpenSea Stream in ${(delay/1000).toFixed(1)}s (attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+    setTimeout(connect, delay);
   } else {
-    console.error('Max reconnect attempts reached for OpenSea Stream');
+    console.error('❌ Max reconnect attempts reached for OpenSea Stream. Will retry in 5 minutes.');
+    // Reset and try again after a longer delay
+    setTimeout(() => {
+      console.log('🔄 Resetting reconnect attempts and trying again...');
+      reconnectAttempts = 0;
+      connect();
+    }, 5 * 60 * 1000); // 5 minutes
   }
 }
 
 function sendHeartbeat(ref: string) {
-  if (ws && ws.readyState === ws.OPEN) {
+  if (ws && ws.readyState === 1) { // OPEN
     ws.send(JSON.stringify({
       topic: 'phoenix',
       event: 'heartbeat',
