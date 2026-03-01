@@ -92,6 +92,7 @@ async function handleTokenDeployed(log: Log) {
       imageUrl: undefined,
       websiteUrl: undefined,
       twitterUrl: undefined,
+      isVerified: false,
     });
     
     console.log(`✅ Token inserted: ${metadata.symbol} (${token})`);
