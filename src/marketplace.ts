@@ -900,7 +900,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
           const errJson = JSON.parse(errText);
           errorDetail = errJson.errors?.[0] || errJson.detail || errJson.message || errorDetail;
         } catch {}
-        return c.json({ error: errorDetail, listings: {}, debug: { url, status: response.status } }, response.status);
+        return c.json({ error: errorDetail, listings: {}, debug: { url, status: response.status } }, 500 as const);
       }
 
       const data = await response.json();
@@ -1002,7 +1002,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       if (!response.ok) {
         const errText = await response.text();
         console.error(`OpenSea events error ${response.status}:`, errText);
-        return c.json({ error: `OpenSea API error: ${response.status}`, events: [] }, response.status);
+        return c.json({ error: `OpenSea API error: ${response.status}`, events: [] }, 500 as const);
       }
 
       const data = await response.json();
@@ -1043,7 +1043,8 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     }
   });
 
-  // GET /marketplace/opensea/offers/:collection/:tokenId - Get offers for a specific NFT
+  // GET /marketplace/opensea/offers/:collection/:tokenId - Get ALL offers for a specific NFT
+  // This includes both item-specific offers AND collection-wide offers that can be accepted
   marketplace.get('/opensea/offers/:collection/:tokenId', async (c) => {
     const collection = c.req.param('collection').toLowerCase();
     const tokenId = c.req.param('tokenId');
@@ -1057,36 +1058,95 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
 
     try {
-      const url = `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenId}&order_by=eth_price&order_direction=desc&limit=${limit}`;
-
-      const response = await fetch(url, {
-        headers: {
-          'accept': 'application/json',
-          'x-api-key': OPENSEA_API_KEY,
-        },
+      // First get collection slug from contract address
+      const contractUrl = `https://api.opensea.io/api/v2/chain/${chainSlug}/contract/${collection}`;
+      const contractRes = await fetch(contractUrl, {
+        headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
       });
-
-      if (!response.ok) {
-        const errText = await response.text();
-        console.error(`OpenSea offers error ${response.status}:`, errText);
-        return c.json({ error: `OpenSea API error: ${response.status}`, offers: [] }, response.status);
+      
+      let collectionSlug = collection;
+      if (contractRes.ok) {
+        const contractData = await contractRes.json();
+        collectionSlug = contractData.collection || collection;
       }
 
-      const data = await response.json();
-      
-      const offers = (data.orders || []).map((order: any) => ({
-        orderHash: order.order_hash,
-        price: order.price?.current?.value || '0',
-        currency: order.price?.current?.currency || 'WETH',
-        decimals: order.price?.current?.decimals || 18,
-        offerer: order.maker?.address,
-        expiration: order.expiration_date,
-        protocolAddress: order.protocol_address,
-        orderData: order.protocol_data?.parameters || null,
-        signature: order.protocol_data?.signature || '',
-      }));
+      // Fetch BOTH item-specific offers AND collection-wide offers in parallel
+      const [itemOffersRes, collectionOffersRes] = await Promise.all([
+        // Item-specific offers for this exact NFT
+        fetch(
+          `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenId}&order_by=eth_price&order_direction=desc&limit=${limit}`,
+          { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
+        ),
+        // Collection-wide offers that can be accepted for ANY NFT in the collection
+        fetch(
+          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`,
+          { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
+        ),
+      ]);
 
-      return c.json({ offers, count: offers.length, tokenId, collection, chain });
+      const allOffers: any[] = [];
+
+      // Parse item-specific offers
+      if (itemOffersRes.ok) {
+        const itemData = await itemOffersRes.json();
+        for (const order of (itemData.orders || [])) {
+          allOffers.push({
+            orderHash: order.order_hash,
+            price: order.price?.current?.value || '0',
+            currency: order.price?.current?.currency || 'WETH',
+            decimals: order.price?.current?.decimals || 18,
+            offerer: order.maker?.address,
+            expiration: order.expiration_date,
+            protocolAddress: order.protocol_address,
+            orderData: order.protocol_data?.parameters || null,
+            signature: order.protocol_data?.signature || '',
+            isCollectionOffer: false,
+            tokenId: tokenId,
+          });
+        }
+      }
+
+      // Parse collection-wide offers (these can be accepted for this NFT too!)
+      if (collectionOffersRes.ok) {
+        const collData = await collectionOffersRes.json();
+        for (const order of (collData.offers || [])) {
+          allOffers.push({
+            orderHash: order.order_hash,
+            price: order.price?.current?.value || order.price?.value || '0',
+            currency: order.price?.current?.currency || order.price?.currency || 'WETH',
+            decimals: order.price?.current?.decimals || 18,
+            offerer: order.maker?.address || order.protocol_data?.parameters?.offerer,
+            expiration: order.expiration_date,
+            protocolAddress: order.protocol_address,
+            orderData: order.protocol_data?.parameters || null,
+            signature: order.protocol_data?.signature || '',
+            isCollectionOffer: true,
+            tokenId: null, // Applies to any NFT in collection
+          });
+        }
+      }
+
+      // Sort all offers by price descending (highest first)
+      allOffers.sort((a, b) => {
+        const priceA = BigInt(a.price || '0');
+        const priceB = BigInt(b.price || '0');
+        return priceB > priceA ? 1 : priceB < priceA ? -1 : 0;
+      });
+
+      // Get best offer (highest price)
+      const bestOffer = allOffers.length > 0 ? allOffers[0] : null;
+
+      return c.json({ 
+        offers: allOffers, 
+        count: allOffers.length, 
+        tokenId, 
+        collection, 
+        collectionSlug,
+        chain,
+        bestOffer,
+        itemOffersCount: allOffers.filter(o => !o.isCollectionOffer).length,
+        collectionOffersCount: allOffers.filter(o => o.isCollectionOffer).length,
+      });
     } catch (e: any) {
       console.error('OpenSea offers fetch error:', e);
       return c.json({ error: e.message, offers: [] }, 500);
@@ -1112,14 +1172,14 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       });
 
       if (!response.ok) {
-        return c.json({ error: `OpenSea API error: ${response.status}` }, response.status);
+        return c.json({ error: `OpenSea API error: ${response.status}` }, 500 as const);
       }
 
       const data = await response.json();
       return c.json(data);
     } catch (e: any) {
       console.error('OpenSea collection fetch error:', e);
-      return c.json({ error: e.message }, 500);
+      return c.json({ error: e.message }, 500 as const);
     }
   });
 
@@ -1381,7 +1441,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       if (!response.ok) {
         const errText = await response.text();
         console.error("OpenSea fulfill error:", errText);
-        return c.json({ error: "OpenSea API error", details: errText }, response.status);
+        return c.json({ error: "OpenSea API error", details: errText }, 500 as const);
       }
 
       const data = await response.json();
@@ -1474,6 +1534,179 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       return c.json(data);
     } catch (e: any) {
       console.error("Fulfill error:", e);
+      return c.json({ error: e.message }, 500);
+    }
+  });
+
+  // POST /marketplace/opensea/fulfill-offer - Get fulfillment data for accepting an offer
+  // This is different from fulfill (for listings) - offers are accepted by the NFT owner
+  marketplace.post("/opensea/fulfill-offer", async (c) => {
+    const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY;
+    if (!OPENSEA_API_KEY) {
+      return c.json({ error: "OpenSea API key not configured" }, 500);
+    }
+
+    try {
+      const body = await c.req.json();
+      const { orderHash, chain, fulfiller, tokenId, collectionAddress, isCollectionOffer } = body;
+
+      if (!orderHash || !fulfiller) {
+        return c.json({ error: "Missing orderHash or fulfiller" }, 400);
+      }
+
+      const chainSlug = chain === "ethereum" ? "ethereum" : "base";
+
+      // Call OpenSea Offer Fulfillment API
+      // For offers, we use /api/v2/offers/fulfillment_data
+      const url = "https://api.opensea.io/api/v2/offers/fulfillment_data";
+      
+      // Build the request body based on whether it's a collection offer or item offer
+      const requestBody: any = {
+        offer: {
+          hash: orderHash,
+          chain: chainSlug,
+          protocol_address: "0x0000000000000068F116a894984e2DB1123eB395",
+        },
+        fulfiller: {
+          address: fulfiller,
+        },
+      };
+
+      // For collection offers, we need to specify which NFT we're selling
+      if (isCollectionOffer && tokenId && collectionAddress) {
+        requestBody.consideration = {
+          asset_contract_address: collectionAddress,
+          token_id: tokenId,
+        };
+      }
+
+      console.log(`🔄 Fulfilling offer: ${orderHash}, isCollection: ${isCollectionOffer}, tokenId: ${tokenId}`);
+
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "accept": "application/json",
+          "content-type": "application/json",
+          "x-api-key": OPENSEA_API_KEY,
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        console.error("OpenSea offer fulfill error:", errText);
+        return c.json({ error: "OpenSea API error", details: errText }, 500 as const);
+      }
+
+      const data = await response.json();
+      
+      // Extract transaction data
+      const tx = data.fulfillment_data?.transaction;
+      if (tx) {
+        // OpenSea returns transaction data that may need encoding
+        if (tx.input_data?.parameters) {
+          const params = tx.input_data.parameters;
+          const { encodeFunctionData } = await import('viem');
+          
+          // Determine which function to use based on the input_data
+          const fnName = tx.input_data.function || 'fulfillBasicOrder_efficient_6GL6yc';
+          
+          // Seaport ABI for basic order fulfillment
+          const seaportAbi = [{
+            name: 'fulfillBasicOrder_efficient_6GL6yc',
+            type: 'function',
+            inputs: [{
+              name: 'parameters',
+              type: 'tuple',
+              components: [
+                { name: 'considerationToken', type: 'address' },
+                { name: 'considerationIdentifier', type: 'uint256' },
+                { name: 'considerationAmount', type: 'uint256' },
+                { name: 'offerer', type: 'address' },
+                { name: 'zone', type: 'address' },
+                { name: 'offerToken', type: 'address' },
+                { name: 'offerIdentifier', type: 'uint256' },
+                { name: 'offerAmount', type: 'uint256' },
+                { name: 'basicOrderType', type: 'uint8' },
+                { name: 'startTime', type: 'uint256' },
+                { name: 'endTime', type: 'uint256' },
+                { name: 'zoneHash', type: 'bytes32' },
+                { name: 'salt', type: 'uint256' },
+                { name: 'offererConduitKey', type: 'bytes32' },
+                { name: 'fulfillerConduitKey', type: 'bytes32' },
+                { name: 'totalOriginalAdditionalRecipients', type: 'uint256' },
+                { name: 'additionalRecipients', type: 'tuple[]', components: [
+                  { name: 'amount', type: 'uint256' },
+                  { name: 'recipient', type: 'address' }
+                ]},
+                { name: 'signature', type: 'bytes' }
+              ]
+            }],
+            outputs: [{ name: '', type: 'bool' }]
+          }] as const;
+
+          try {
+            const formattedParams = {
+              considerationToken: params.considerationToken as `0x${string}`,
+              considerationIdentifier: BigInt(params.considerationIdentifier || '0'),
+              considerationAmount: BigInt(params.considerationAmount || '0'),
+              offerer: params.offerer as `0x${string}`,
+              zone: params.zone as `0x${string}`,
+              offerToken: params.offerToken as `0x${string}`,
+              offerIdentifier: BigInt(params.offerIdentifier || '0'),
+              offerAmount: BigInt(params.offerAmount || '1'),
+              basicOrderType: Number(params.basicOrderType || 0),
+              startTime: BigInt(params.startTime || '0'),
+              endTime: BigInt(params.endTime || '0'),
+              zoneHash: params.zoneHash as `0x${string}`,
+              salt: BigInt(params.salt || '0'),
+              offererConduitKey: params.offererConduitKey as `0x${string}`,
+              fulfillerConduitKey: params.fulfillerConduitKey as `0x${string}`,
+              totalOriginalAdditionalRecipients: BigInt(params.totalOriginalAdditionalRecipients || '0'),
+              additionalRecipients: (params.additionalRecipients || []).map((r: any) => ({
+                amount: BigInt(r.amount || '0'),
+                recipient: r.recipient as `0x${string}`
+              })),
+              signature: params.signature as `0x${string}`
+            };
+
+            const calldata = encodeFunctionData({
+              abi: seaportAbi,
+              functionName: 'fulfillBasicOrder_efficient_6GL6yc',
+              args: [formattedParams]
+            });
+
+            return c.json({
+              transaction: {
+                to: tx.to,
+                value: tx.value || '0',
+                data: calldata,
+              },
+              fulfillment_data: data.fulfillment_data,
+            });
+          } catch (encodeError) {
+            console.error('Error encoding offer fulfill calldata:', encodeError);
+            // Fall through to raw data
+          }
+        }
+
+        // If we have raw calldata, use it directly
+        if (tx.data || tx.input) {
+          return c.json({
+            transaction: {
+              to: tx.to,
+              value: tx.value || '0',
+              data: tx.data || tx.input,
+            },
+            fulfillment_data: data.fulfillment_data,
+          });
+        }
+      }
+
+      // Return raw response if we couldn't process it
+      return c.json(data);
+    } catch (e: any) {
+      console.error("Offer fulfill error:", e);
       return c.json({ error: e.message }, 500);
     }
   });
