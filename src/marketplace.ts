@@ -1284,21 +1284,16 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         collectionSlug = contractData.collection || collection;
       }
 
-      // Fetch both collection-wide offers AND item-specific offers
-      const [collectionOffersRes, itemOffersRes] = await Promise.all([
-        // Collection offers endpoint (offers that apply to any NFT in collection)
-        fetch(`https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`, {
-          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
-        }),
-        // Item-specific offers (for fallback)
-        fetch(`https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&order_by=eth_price&order_direction=asc&limit=${limit}`, {
-          headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY },
-        }),
-      ]);
+      // Fetch ONLY collection-wide offers (NOT item-specific)
+      // Item-specific offers have high prices for rare NFTs and shouldn't be shown as collection top offer
+      const collectionOffersRes = await fetch(
+        `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`,
+        { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
+      );
 
       const allOffers: any[] = [];
 
-      // Parse collection-wide offers
+      // Parse collection-wide offers ONLY
       if (collectionOffersRes.ok) {
         const collectionData = await collectionOffersRes.json();
         const collectionOffers = collectionData.offers || [];
@@ -1317,33 +1312,14 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         }
       }
 
-      // Parse item-specific offers
-      if (itemOffersRes.ok) {
-        const itemData = await itemOffersRes.json();
-        const itemOrders = itemData.orders || [];
-        
-        for (const order of itemOrders) {
-          allOffers.push({
-            orderHash: order.order_hash,
-            price: order.price?.current?.value || '0',
-            currency: order.price?.current?.currency || 'WETH',
-            decimals: order.price?.current?.decimals || 18,
-            offerer: order.maker?.address,
-            tokenId: order.protocol_data?.parameters?.consideration?.[0]?.identifierOrCriteria || null,
-            expiration: order.expiration_date,
-            isCollectionOffer: false,
-          });
-        }
-      }
-
-      // Sort all offers by price (low to high) and get minBid
+      // Sort by price (high to low for top offer, but we also need minBid)
       allOffers.sort((a, b) => {
         const priceA = BigInt(a.price || '0');
         const priceB = BigInt(b.price || '0');
         return priceA < priceB ? -1 : priceA > priceB ? 1 : 0;
       });
 
-      // Get min bid (lowest offer)
+      // Get min bid (lowest offer) - kept for backwards compat
       const minBid = allOffers.length > 0 ? allOffers[0].price : null;
 
       return c.json({ 
