@@ -1086,9 +1086,9 @@ export function createMarketplaceRoutes(sql: Sql | null) {
           `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenId}&order_by=eth_price&order_direction=desc&limit=${limit}`,
           { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
         ),
-        // Collection-wide offers - use /all endpoint for active offers
+        // Collection-wide offers ONLY - NOT /all (which includes item-specific)
         fetch(
-          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}/all?limit=${limit}`,
+          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`,
           { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
         ),
       ]);
