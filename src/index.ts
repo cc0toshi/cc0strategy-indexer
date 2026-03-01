@@ -20,6 +20,30 @@ import { createMarketplaceRoutes } from './marketplace.js';
 import { initOpenSeaStream, setSocketIoServer, subscribeToCollection, unsubscribeFromCollection, getStreamStatus, onEvent } from './opensea-stream.js';
 
 // ============================================
+// GLOBAL ERROR HANDLERS - PREVENT CRASH
+// ============================================
+// These catch ANY unhandled errors and prevent process crash
+// The OpenSea WebSocket is the main culprit, but this protects against everything
+
+process.on('uncaughtException', (error: Error, origin: string) => {
+  console.error('🚨 UNCAUGHT EXCEPTION (process NOT crashing):');
+  console.error('Origin:', origin);
+  console.error('Error:', error.message);
+  console.error('Stack:', error.stack);
+  // DO NOT exit - keep the server running
+  // The error is logged, but the process continues
+});
+
+process.on('unhandledRejection', (reason: any, promise: Promise<any>) => {
+  console.error('🚨 UNHANDLED REJECTION (process NOT crashing):');
+  console.error('Reason:', reason?.message || reason);
+  if (reason?.stack) {
+    console.error('Stack:', reason.stack);
+  }
+  // DO NOT exit - keep the server running
+});
+
+// ============================================
 // CACHE CONFIGURATION
 // ============================================
 const MARKET_DATA_REFRESH_MS = 60 * 1000;  // 60 seconds
@@ -1402,13 +1426,19 @@ io.on('connection', (socket) => {
 // Set Socket.IO server for OpenSea stream to broadcast events
 setSocketIoServer(io);
 
-// Initialize OpenSea Stream API
-initOpenSeaStream();
+// Initialize OpenSea Stream API (OPTIONAL - failures won't crash the server)
+try {
+  initOpenSeaStream();
+  
+  // Log OpenSea events
+  onEvent((event) => {
+    console.log(`📨 OpenSea event: ${event.event_type} - ${event.collection_slug || event.collection_address} #${event.token_id}`);
+  });
+} catch (e: any) {
+  console.error('⚠️ OpenSea Stream initialization failed (server continues without it):', e.message);
+}
 
-// Log OpenSea events
-onEvent((event) => {
-  console.log(`📨 OpenSea event: ${event.event_type} - ${event.collection_slug || event.collection_address} #${event.token_id}`);
-});
+console.log('✅ OpenSea Stream is OPTIONAL - API/cache will work even if stream is unavailable');
 
 // Start the server
 httpServer.listen(PORT, () => {
