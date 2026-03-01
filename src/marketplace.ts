@@ -1043,19 +1043,20 @@ export function createMarketplaceRoutes(sql: Sql | null) {
     }
   });
 
-  // GET /marketplace/opensea/offers/:collection/:tokenId - Get ALL offers for a specific NFT
-  // This includes both item-specific offers AND collection-wide offers that can be accepted
+  // GET /marketplace/opensea/offers/:collection/:tokenId - Get ACTIVE, EXECUTABLE offers ONLY
+  // Filters out expired, cancelled, and fulfilled offers. Only shows offers that can be accepted NOW.
   marketplace.get('/opensea/offers/:collection/:tokenId', async (c) => {
     const collection = c.req.param('collection').toLowerCase();
     const tokenId = c.req.param('tokenId');
     const chain = c.req.query('chain') || 'ethereum';
-    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 50);
+    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 50);
 
     if (!OPENSEA_API_KEY) {
       return c.json({ error: 'OpenSea API key not configured', offers: [] }, 500);
     }
 
     const chainSlug = OPENSEA_CHAINS[chain] || 'ethereum';
+    const now = Math.floor(Date.now() / 1000); // Current Unix timestamp
 
     try {
       // First get collection slug from contract address
@@ -1070,59 +1071,132 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         collectionSlug = contractData.collection || collection;
       }
 
-      // Fetch BOTH item-specific offers AND collection-wide offers in parallel
-      const [itemOffersRes, collectionOffersRes] = await Promise.all([
-        // Item-specific offers for this exact NFT
+      // Fetch from multiple endpoints in parallel:
+      // 1. Best offer for this specific NFT (validated by OpenSea as fillable)
+      // 2. All item offers (we'll filter expired/cancelled)
+      // 3. All collection offers (we'll filter expired/cancelled)
+      const [bestOfferRes, itemOffersRes, collectionOffersRes] = await Promise.all([
+        // Best VALID offer for this specific NFT - OpenSea validates it's actually fillable
+        fetch(
+          `https://api.opensea.io/api/v2/offers/nft/${chainSlug}/${collection}/${tokenId}/best`,
+          { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
+        ),
+        // Item-specific offers
         fetch(
           `https://api.opensea.io/api/v2/orders/${chainSlug}/seaport/offers?asset_contract_address=${collection}&token_ids=${tokenId}&order_by=eth_price&order_direction=desc&limit=${limit}`,
           { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
         ),
-        // Collection-wide offers that can be accepted for ANY NFT in the collection
+        // Collection-wide offers - use /all endpoint for active offers
         fetch(
-          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}?limit=${limit}`,
+          `https://api.opensea.io/api/v2/offers/collection/${collectionSlug}/all?limit=${limit}`,
           { headers: { 'accept': 'application/json', 'x-api-key': OPENSEA_API_KEY } }
         ),
       ]);
 
       const allOffers: any[] = [];
+      const seenOrderHashes = new Set<string>();
+
+      // Helper to check if offer is active (not expired)
+      const isOfferActive = (expirationDate: string | number | null | undefined): boolean => {
+        if (!expirationDate) return true; // No expiration = active
+        let expTimestamp: number;
+        if (typeof expirationDate === 'string') {
+          // Could be ISO string or Unix timestamp string
+          if (expirationDate.includes('T') || expirationDate.includes('-')) {
+            expTimestamp = Math.floor(new Date(expirationDate).getTime() / 1000);
+          } else {
+            expTimestamp = parseInt(expirationDate);
+          }
+        } else {
+          expTimestamp = expirationDate;
+        }
+        // Must be at least 60 seconds in the future to be actionable
+        return expTimestamp > now + 60;
+      };
+
+      // Helper to parse and validate an offer
+      const parseOffer = (order: any, isCollectionOffer: boolean): any | null => {
+        const orderHash = order.order_hash;
+        if (!orderHash || seenOrderHashes.has(orderHash)) return null;
+        
+        // Get expiration from multiple possible locations
+        const expiration = order.expiration_date || 
+                          order.protocol_data?.parameters?.endTime ||
+                          order.closing_date;
+        
+        // STRICT: Filter out expired offers
+        if (!isOfferActive(expiration)) {
+          console.log(`Filtering expired offer ${orderHash}: exp=${expiration}, now=${now}`);
+          return null;
+        }
+        
+        // Filter out cancelled/filled offers (OpenSea marks these)
+        if (order.cancelled || order.finalized || order.filled) {
+          console.log(`Filtering cancelled/filled offer ${orderHash}`);
+          return null;
+        }
+        
+        seenOrderHashes.add(orderHash);
+        
+        // Calculate expiration timestamp for frontend display
+        let expirationTimestamp: number | null = null;
+        if (expiration) {
+          if (typeof expiration === 'string') {
+            if (expiration.includes('T') || expiration.includes('-')) {
+              expirationTimestamp = Math.floor(new Date(expiration).getTime() / 1000);
+            } else {
+              expirationTimestamp = parseInt(expiration);
+            }
+          } else {
+            expirationTimestamp = expiration;
+          }
+        }
+        
+        return {
+          orderHash,
+          price: order.price?.current?.value || order.price?.value || '0',
+          currency: order.price?.current?.currency || order.price?.currency || 'WETH',
+          decimals: order.price?.current?.decimals || 18,
+          offerer: order.maker?.address || order.protocol_data?.parameters?.offerer,
+          expiration: expiration,
+          expirationTimestamp,
+          protocolAddress: order.protocol_address,
+          orderData: order.protocol_data?.parameters || null,
+          signature: order.protocol_data?.signature || '',
+          isCollectionOffer,
+          tokenId: isCollectionOffer ? null : tokenId,
+          remaining: order.remaining_quantity || 1,
+        };
+      };
+
+      // Parse best offer first (this is validated by OpenSea as actually fillable)
+      let validatedBestOffer = null;
+      if (bestOfferRes.ok) {
+        const bestData = await bestOfferRes.json();
+        if (bestData.order_hash) {
+          validatedBestOffer = parseOffer(bestData, false);
+          if (validatedBestOffer) {
+            validatedBestOffer.validatedByOpenSea = true;
+            allOffers.push(validatedBestOffer);
+          }
+        }
+      }
 
       // Parse item-specific offers
       if (itemOffersRes.ok) {
         const itemData = await itemOffersRes.json();
         for (const order of (itemData.orders || [])) {
-          allOffers.push({
-            orderHash: order.order_hash,
-            price: order.price?.current?.value || '0',
-            currency: order.price?.current?.currency || 'WETH',
-            decimals: order.price?.current?.decimals || 18,
-            offerer: order.maker?.address,
-            expiration: order.expiration_date,
-            protocolAddress: order.protocol_address,
-            orderData: order.protocol_data?.parameters || null,
-            signature: order.protocol_data?.signature || '',
-            isCollectionOffer: false,
-            tokenId: tokenId,
-          });
+          const parsed = parseOffer(order, false);
+          if (parsed) allOffers.push(parsed);
         }
       }
 
-      // Parse collection-wide offers (these can be accepted for this NFT too!)
+      // Parse collection-wide offers
       if (collectionOffersRes.ok) {
         const collData = await collectionOffersRes.json();
         for (const order of (collData.offers || [])) {
-          allOffers.push({
-            orderHash: order.order_hash,
-            price: order.price?.current?.value || order.price?.value || '0',
-            currency: order.price?.current?.currency || order.price?.currency || 'WETH',
-            decimals: order.price?.current?.decimals || 18,
-            offerer: order.maker?.address || order.protocol_data?.parameters?.offerer,
-            expiration: order.expiration_date,
-            protocolAddress: order.protocol_address,
-            orderData: order.protocol_data?.parameters || null,
-            signature: order.protocol_data?.signature || '',
-            isCollectionOffer: true,
-            tokenId: null, // Applies to any NFT in collection
-          });
+          const parsed = parseOffer(order, true);
+          if (parsed) allOffers.push(parsed);
         }
       }
 
@@ -1133,7 +1207,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         return priceB > priceA ? 1 : priceB < priceA ? -1 : 0;
       });
 
-      // Get best offer (highest price)
+      // Get best offer (highest price from our filtered list)
       const bestOffer = allOffers.length > 0 ? allOffers[0] : null;
 
       return c.json({ 
@@ -1144,8 +1218,10 @@ export function createMarketplaceRoutes(sql: Sql | null) {
         collectionSlug,
         chain,
         bestOffer,
+        validatedBestOffer, // The one OpenSea specifically validated as fillable
         itemOffersCount: allOffers.filter(o => !o.isCollectionOffer).length,
         collectionOffersCount: allOffers.filter(o => o.isCollectionOffer).length,
+        timestamp: now,
       });
     } catch (e: any) {
       console.error('OpenSea offers fetch error:', e);
