@@ -1655,13 +1655,180 @@ export function createMarketplaceRoutes(sql: Sql | null) {
       // Extract transaction data
       const tx = data.fulfillment_data?.transaction;
       if (tx) {
-        // OpenSea returns transaction data that may need encoding
+        const { encodeFunctionData, encodeAbiParameters } = await import('viem');
+        const fnName = tx.function || '';
+        
+        // Handle matchAdvancedOrders (used for collection offers)
+        if (fnName.startsWith('matchAdvancedOrders') && tx.input_data?.orders) {
+          try {
+            // Seaport ABI for matchAdvancedOrders
+            const matchAdvancedOrdersAbi = [{
+              name: 'matchAdvancedOrders',
+              type: 'function',
+              inputs: [
+                {
+                  name: 'orders',
+                  type: 'tuple[]',
+                  components: [
+                    {
+                      name: 'parameters',
+                      type: 'tuple',
+                      components: [
+                        { name: 'offerer', type: 'address' },
+                        { name: 'zone', type: 'address' },
+                        { name: 'offer', type: 'tuple[]', components: [
+                          { name: 'itemType', type: 'uint8' },
+                          { name: 'token', type: 'address' },
+                          { name: 'identifierOrCriteria', type: 'uint256' },
+                          { name: 'startAmount', type: 'uint256' },
+                          { name: 'endAmount', type: 'uint256' },
+                        ]},
+                        { name: 'consideration', type: 'tuple[]', components: [
+                          { name: 'itemType', type: 'uint8' },
+                          { name: 'token', type: 'address' },
+                          { name: 'identifierOrCriteria', type: 'uint256' },
+                          { name: 'startAmount', type: 'uint256' },
+                          { name: 'endAmount', type: 'uint256' },
+                          { name: 'recipient', type: 'address' },
+                        ]},
+                        { name: 'orderType', type: 'uint8' },
+                        { name: 'startTime', type: 'uint256' },
+                        { name: 'endTime', type: 'uint256' },
+                        { name: 'zoneHash', type: 'bytes32' },
+                        { name: 'salt', type: 'uint256' },
+                        { name: 'conduitKey', type: 'bytes32' },
+                        { name: 'totalOriginalConsiderationItems', type: 'uint256' },
+                      ]
+                    },
+                    { name: 'numerator', type: 'uint120' },
+                    { name: 'denominator', type: 'uint120' },
+                    { name: 'signature', type: 'bytes' },
+                    { name: 'extraData', type: 'bytes' },
+                  ]
+                },
+                {
+                  name: 'criteriaResolvers',
+                  type: 'tuple[]',
+                  components: [
+                    { name: 'orderIndex', type: 'uint256' },
+                    { name: 'side', type: 'uint8' },
+                    { name: 'index', type: 'uint256' },
+                    { name: 'identifier', type: 'uint256' },
+                    { name: 'criteriaProof', type: 'bytes32[]' },
+                  ]
+                },
+                {
+                  name: 'fulfillments',
+                  type: 'tuple[]',
+                  components: [
+                    { name: 'offerComponents', type: 'tuple[]', components: [
+                      { name: 'orderIndex', type: 'uint256' },
+                      { name: 'itemIndex', type: 'uint256' },
+                    ]},
+                    { name: 'considerationComponents', type: 'tuple[]', components: [
+                      { name: 'orderIndex', type: 'uint256' },
+                      { name: 'itemIndex', type: 'uint256' },
+                    ]},
+                  ]
+                },
+                { name: 'recipient', type: 'address' },
+              ],
+              outputs: [{ name: 'executions', type: 'tuple[]', components: [
+                { name: 'item', type: 'tuple', components: [
+                  { name: 'itemType', type: 'uint8' },
+                  { name: 'token', type: 'address' },
+                  { name: 'identifier', type: 'uint256' },
+                  { name: 'amount', type: 'uint256' },
+                  { name: 'recipient', type: 'address' },
+                ]},
+                { name: 'offerer', type: 'address' },
+                { name: 'conduitKey', type: 'bytes32' },
+              ]}],
+              stateMutability: 'payable',
+            }] as const;
+
+            const inputData = tx.input_data;
+            
+            // Format orders
+            const orders = inputData.orders.map((o: any) => ({
+              parameters: {
+                offerer: o.parameters.offerer as `0x${string}`,
+                zone: o.parameters.zone as `0x${string}`,
+                offer: o.parameters.offer.map((item: any) => ({
+                  itemType: Number(item.itemType),
+                  token: item.token as `0x${string}`,
+                  identifierOrCriteria: BigInt(item.identifierOrCriteria || '0'),
+                  startAmount: BigInt(item.startAmount || '0'),
+                  endAmount: BigInt(item.endAmount || '0'),
+                })),
+                consideration: o.parameters.consideration.map((item: any) => ({
+                  itemType: Number(item.itemType),
+                  token: item.token as `0x${string}`,
+                  identifierOrCriteria: BigInt(item.identifierOrCriteria || '0'),
+                  startAmount: BigInt(item.startAmount || '0'),
+                  endAmount: BigInt(item.endAmount || '0'),
+                  recipient: item.recipient as `0x${string}`,
+                })),
+                orderType: Number(o.parameters.orderType),
+                startTime: BigInt(o.parameters.startTime || '0'),
+                endTime: BigInt(o.parameters.endTime || '0'),
+                zoneHash: o.parameters.zoneHash as `0x${string}`,
+                salt: BigInt(o.parameters.salt || '0'),
+                conduitKey: o.parameters.conduitKey as `0x${string}`,
+                totalOriginalConsiderationItems: BigInt(o.parameters.totalOriginalConsiderationItems || '0'),
+              },
+              numerator: BigInt(o.numerator || '1'),
+              denominator: BigInt(o.denominator || '1'),
+              signature: (o.signature || '0x') as `0x${string}`,
+              extraData: (o.extraData || '0x') as `0x${string}`,
+            }));
+
+            // Format criteria resolvers
+            const criteriaResolvers = (inputData.criteriaResolvers || []).map((r: any) => ({
+              orderIndex: BigInt(r.orderIndex || '0'),
+              side: Number(r.side),
+              index: BigInt(r.index || '0'),
+              identifier: BigInt(r.identifier || '0'),
+              criteriaProof: (r.criteriaProof || []) as `0x${string}`[],
+            }));
+
+            // Format fulfillments
+            const fulfillments = (inputData.fulfillments || []).map((f: any) => ({
+              offerComponents: (f.offerComponents || []).map((c: any) => ({
+                orderIndex: BigInt(c.orderIndex || '0'),
+                itemIndex: BigInt(c.itemIndex || '0'),
+              })),
+              considerationComponents: (f.considerationComponents || []).map((c: any) => ({
+                orderIndex: BigInt(c.orderIndex || '0'),
+                itemIndex: BigInt(c.itemIndex || '0'),
+              })),
+            }));
+
+            const calldata = encodeFunctionData({
+              abi: matchAdvancedOrdersAbi,
+              functionName: 'matchAdvancedOrders',
+              args: [orders, criteriaResolvers, fulfillments, inputData.recipient as `0x${string}`]
+            });
+
+            console.log(`✅ Encoded matchAdvancedOrders for offer ${orderHash}`);
+
+            return c.json({
+              transaction: {
+                to: tx.to,
+                value: tx.value || '0',
+                data: calldata,
+              },
+              fulfillment_data: data.fulfillment_data,
+            });
+          } catch (encodeError) {
+            console.error('Error encoding matchAdvancedOrders:', encodeError);
+            // Fall through to try other methods
+          }
+        }
+        
+        // Handle fulfillBasicOrder (used for simple offers)
         if (tx.input_data?.parameters) {
           const params = tx.input_data.parameters;
-          const { encodeFunctionData } = await import('viem');
-          
-          // Determine which function to use based on the input_data
-          const fnName = tx.input_data.function || 'fulfillBasicOrder_efficient_6GL6yc';
           
           // Seaport ABI for basic order fulfillment
           const seaportAbi = [{
@@ -1737,7 +1904,7 @@ export function createMarketplaceRoutes(sql: Sql | null) {
               fulfillment_data: data.fulfillment_data,
             });
           } catch (encodeError) {
-            console.error('Error encoding offer fulfill calldata:', encodeError);
+            console.error('Error encoding fulfillBasicOrder:', encodeError);
             // Fall through to raw data
           }
         }
