@@ -1,6 +1,7 @@
 // OpenSea Stream API WebSocket Integration
 // Docs: https://docs.opensea.io/reference/stream-api-overview
 // Using Phoenix Protocol over WebSocket
+// NOTE: This is OPTIONAL - the rest of the indexer works without it
 
 import type { Server } from 'socket.io';
 import { EventEmitter } from 'events';
@@ -8,6 +9,10 @@ import WebSocket from 'ws'; // Node.js WebSocket (default import for ESM)
 
 const OPENSEA_STREAM_URL = 'wss://stream.openseabeta.com/socket/websocket';
 const OPENSEA_API_KEY = process.env.OPENSEA_API_KEY || '';
+
+// Track if stream is available (graceful degradation)
+let streamAvailable = false;
+let lastStreamError: string | null = null;
 
 // Event types from OpenSea Stream API
 export type OpenSeaEventType = 
@@ -113,16 +118,21 @@ function stopHeartbeat() {
 function connect() {
   if (!OPENSEA_API_KEY) {
     console.log('⚠️ OpenSea API key not configured, WebSocket disabled');
+    streamAvailable = false;
     return;
   }
 
-  // Clean up any existing connection
+  // Clean up any existing connection SAFELY
   if (ws) {
     try {
       ws.removeAllListeners();
-      ws.close();
+      // Only close if connection is open or connecting
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close();
+      }
     } catch (e) {
-      // Ignore cleanup errors
+      // Ignore cleanup errors - connection might already be closed
+      console.log('⚠️ WebSocket cleanup error (safe to ignore):', (e as Error).message);
     }
     ws = null;
   }
@@ -132,9 +142,26 @@ function connect() {
     console.log('🔄 Connecting to OpenSea Stream API...');
     ws = new WebSocket(`${OPENSEA_STREAM_URL}?token=${OPENSEA_API_KEY}`);
 
+    // CRITICAL: Handle error event BEFORE it can crash the process
+    // This MUST be registered before any async operations
+    ws.on('error', (error: any) => {
+      const errorCode = error?.code || error?.message || 'unknown';
+      const errorMsg = error?.message || String(error);
+      console.error(`⚠️ OpenSea WebSocket error (${errorCode}):`, errorMsg);
+      
+      // Track the error for status reporting
+      lastStreamError = errorMsg;
+      streamAvailable = false;
+      
+      // DO NOT rethrow - this prevents process crash
+      // The 'close' event will trigger reconnect if needed
+    });
+
     ws.on('open', () => {
       console.log('🔌 Connected to OpenSea Stream API');
       reconnectAttempts = 0;
+      streamAvailable = true;
+      lastStreamError = null;
       
       // Start heartbeat to keep connection alive
       startHeartbeat();
@@ -183,26 +210,27 @@ function connect() {
       }
     });
 
-    ws.on('error', (error: any) => {
-      const errorCode = error?.code || error?.message || 'unknown';
-      console.error(`OpenSea WebSocket error (${errorCode}):`, error.message || error);
-    });
-
     ws.on('close', (code: number, reason: Buffer) => {
       const reasonStr = reason?.toString() || 'no reason';
       console.log(`🔌 OpenSea WebSocket disconnected (code: ${code}, reason: ${reasonStr})`);
+      streamAvailable = false;
       stopHeartbeat();
       attemptReconnect();
     });
 
-    // Handle unexpected errors
+    // Handle unexpected HTTP responses (502, 504, etc.)
     ws.on('unexpected-response', (req: any, res: any) => {
-      console.error(`OpenSea WebSocket unexpected response: ${res.statusCode}`);
+      const statusCode = res?.statusCode || 'unknown';
+      console.error(`⚠️ OpenSea WebSocket unexpected response: ${statusCode}`);
+      lastStreamError = `HTTP ${statusCode}`;
+      streamAvailable = false;
       stopHeartbeat();
-      attemptReconnect();
+      // Don't call attemptReconnect here - 'close' event will fire after this
     });
-  } catch (e) {
-    console.error('Failed to connect to OpenSea Stream:', e);
+  } catch (e: any) {
+    console.error('⚠️ Failed to create OpenSea WebSocket:', e.message || e);
+    lastStreamError = e.message || 'Connection failed';
+    streamAvailable = false;
     attemptReconnect();
   }
 }
@@ -358,8 +386,11 @@ export function initOpenSeaStream() {
 export function getStreamStatus() {
   return {
     connected: ws?.readyState === 1, // 1 = OPEN
+    available: streamAvailable,
     subscribedCollections: Array.from(subscribedCollections),
     reconnectAttempts,
     apiKeyConfigured: !!OPENSEA_API_KEY,
+    lastError: lastStreamError,
+    readyState: ws?.readyState ?? null,
   };
 }
