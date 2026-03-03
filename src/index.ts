@@ -664,7 +664,7 @@ app.get('/health', async (c) => {
   });
 });
 
-// GET /tokens - List all tokens with optional chain filter
+// GET /tokens - List all tokens with optional chain and nft_collection filter
 app.get('/tokens', async (c) => {
   if (!sql) {
     return c.json({ error: 'Database not configured', tokens: [] }, 500);
@@ -674,6 +674,7 @@ app.get('/tokens', async (c) => {
     const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
     const offset = parseInt(c.req.query('offset') || '0');
     const chainFilter = c.req.query('chain');
+    const nftCollectionFilter = c.req.query('nft_collection');
     
     // Validate chain if provided
     if (chainFilter && !validateChain(chainFilter)) {
@@ -681,7 +682,26 @@ app.get('/tokens', async (c) => {
     }
     
     let tokens;
-    if (chainFilter) {
+    if (nftCollectionFilter) {
+      // Filter by NFT collection address
+      const normalizedCollection = nftCollectionFilter.toLowerCase();
+      if (chainFilter) {
+        tokens = await sql`
+          SELECT * FROM tokens 
+          WHERE LOWER(nft_collection) = ${normalizedCollection}
+          AND chain = ${chainFilter}
+          ORDER BY deployed_at DESC 
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      } else {
+        tokens = await sql`
+          SELECT * FROM tokens 
+          WHERE LOWER(nft_collection) = ${normalizedCollection}
+          ORDER BY deployed_at DESC 
+          LIMIT ${limit} OFFSET ${offset}
+        `;
+      }
+    } else if (chainFilter) {
       tokens = await sql`
         SELECT * FROM tokens 
         WHERE chain = ${chainFilter}
@@ -699,7 +719,10 @@ app.get('/tokens', async (c) => {
     return c.json({ 
       tokens, 
       pagination: { limit, offset },
-      filter: chainFilter ? { chain: chainFilter } : null
+      filter: { 
+        chain: chainFilter || null,
+        nft_collection: nftCollectionFilter || null
+      }
     });
   } catch (e: any) {
     console.error('Error fetching tokens:', e.message);
