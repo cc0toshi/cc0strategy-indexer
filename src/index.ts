@@ -199,6 +199,94 @@ if (DATABASE_URL) {
 }
 
 // ============================================
+// DATABASE SCHEMA MIGRATIONS
+// ============================================
+async function runMigrations() {
+  if (!sql) return;
+  
+  console.log('🔄 Running database migrations...');
+  
+  try {
+    // Create collections table
+    await sql`
+      CREATE TABLE IF NOT EXISTS collections (
+        id SERIAL PRIMARY KEY,
+        address TEXT NOT NULL,
+        chain_id INTEGER NOT NULL,
+        name TEXT NOT NULL,
+        image_url TEXT,
+        description TEXT,
+        is_cc0 BOOLEAN DEFAULT true,
+        floor_price_eth NUMERIC,
+        total_supply INTEGER,
+        holder_count INTEGER,
+        added_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE(address, chain_id)
+      )
+    `;
+    console.log('✅ collections table ready');
+    
+    // Create indexes for collections
+    await sql`CREATE INDEX IF NOT EXISTS idx_collections_chain ON collections(chain_id)`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_collections_address ON collections(address)`;
+    
+    // Add collection_id to tokens table
+    await sql.unsafe(`ALTER TABLE tokens ADD COLUMN IF NOT EXISTS collection_id INTEGER REFERENCES collections(id)`);
+    await sql`CREATE INDEX IF NOT EXISTS idx_tokens_collection ON tokens(collection_id)`;
+    console.log('✅ tokens.collection_id column ready');
+    
+    // Seed initial collections
+    await sql`
+      INSERT INTO collections (address, chain_id, name, image_url, is_cc0)
+      VALUES 
+        ('0x79fcdef22feed20eddacbb2587640e45491b757f', 1, 'mfers', 'https://i.seadn.io/gae/J2iIgy5_gmA8IS6sXGKGZeFVZwhldQylk7w7fLepTE9S7ICPCn_dlo8kypX8Ja8O_bvnKR6hFtZsYCiCdEb_9Rzy-tT4UDGQTBUq?w=500', true),
+        ('0x0cc1cf477d41d864854074c2bde160dc88d17160', 1, 'mferdickbutts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true),
+        ('0x5c5d3cbaf7a3419af8e6661486b2d5ec3accfb1b', 8453, 'Based MferDickButts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true)
+      ON CONFLICT (address, chain_id) DO UPDATE SET
+        name = EXCLUDED.name,
+        image_url = EXCLUDED.image_url,
+        updated_at = NOW()
+    `;
+    console.log('✅ Initial collections seeded');
+    
+    // Link existing tokens to collections
+    // DICKSTR (Base) → Based MferDickButts (chain_id 8453)
+    await sql`
+      UPDATE tokens SET collection_id = (
+        SELECT id FROM collections WHERE address = '0x5c5d3cbaf7a3419af8e6661486b2d5ec3accfb1b' AND chain_id = 8453
+      )
+      WHERE UPPER(symbol) = 'DICKSTR' AND chain = 'base' AND collection_id IS NULL
+    `;
+    
+    // MFERSTR (Ethereum) → mfers (chain_id 1)
+    await sql`
+      UPDATE tokens SET collection_id = (
+        SELECT id FROM collections WHERE address = '0x79fcdef22feed20eddacbb2587640e45491b757f' AND chain_id = 1
+      )
+      WHERE UPPER(symbol) = 'MFERSTR' AND chain = 'ethereum' AND collection_id IS NULL
+    `;
+    
+    // MFERDICKBUTT (Ethereum) → mferdickbutts (chain_id 1)
+    await sql`
+      UPDATE tokens SET collection_id = (
+        SELECT id FROM collections WHERE address = '0x0cc1cf477d41d864854074c2bde160dc88d17160' AND chain_id = 1
+      )
+      WHERE UPPER(symbol) = 'MFERDICKBUTT' AND chain = 'ethereum' AND collection_id IS NULL
+    `;
+    
+    console.log('✅ Existing tokens linked to collections');
+    console.log('✅ All migrations complete');
+    
+  } catch (e: any) {
+    console.error('❌ Migration error:', e.message);
+  }
+}
+
+// Run migrations on startup
+runMigrations();
+
+// ============================================
 // WEBSOCKET SERVER
 // ============================================
 let io: SocketIOServer | null = null;
@@ -525,7 +613,7 @@ app.get('/', async (c) => {
   return c.json({ 
     status: 'ok', 
     service: 'cc0strategy-indexer',
-    version: '2.1.0',
+    version: '2.2.0',
     database: sql ? 'connected' : 'not connected',
     websocket: io ? 'enabled' : 'disabled',
     chains: {
@@ -895,6 +983,7 @@ app.post('/tokens', async (c) => {
       twitter_url,
       telegram_url,
       discord_url,
+      collection_id,
     } = body;
     
     // Validate required fields
@@ -907,18 +996,28 @@ app.post('/tokens', async (c) => {
       return c.json({ error: 'Invalid chain. Must be "base" or "ethereum"' }, 400);
     }
     
+    // Validate collection_id if provided
+    let validCollectionId = null;
+    if (collection_id) {
+      const [collection] = await sql`SELECT id FROM collections WHERE id = ${collection_id}`;
+      if (collection) {
+        validCollectionId = collection.id;
+      }
+    }
+    
     // Insert token
     const result = await sql`
       INSERT INTO tokens (
         address, name, symbol, decimals, nft_collection, deployer,
         deploy_tx_hash, deploy_block, deployed_at, image_url, description, pool_id, chain,
-        website_url, twitter_url, telegram_url, discord_url
+        website_url, twitter_url, telegram_url, discord_url, collection_id
       ) VALUES (
         ${address.toLowerCase()}, ${name}, ${symbol}, ${decimals}, ${nft_collection.toLowerCase()},
         ${deployer.toLowerCase()}, ${deploy_tx_hash}, ${deploy_block},
         ${deployed_at || new Date().toISOString()}, ${image_url || null}, ${description || null},
         ${safePoolIdBuffer(pool_id)}, ${chain},
-        ${sanitizeUrl(website_url)}, ${sanitizeUrl(twitter_url)}, ${sanitizeUrl(telegram_url)}, ${sanitizeUrl(discord_url)}
+        ${sanitizeUrl(website_url)}, ${sanitizeUrl(twitter_url)}, ${sanitizeUrl(telegram_url)}, ${sanitizeUrl(discord_url)},
+        ${validCollectionId}
       )
       ON CONFLICT (address) DO UPDATE SET
         name = EXCLUDED.name,
@@ -929,6 +1028,7 @@ app.post('/tokens', async (c) => {
         twitter_url = COALESCE(EXCLUDED.twitter_url, tokens.twitter_url),
         telegram_url = COALESCE(EXCLUDED.telegram_url, tokens.telegram_url),
         discord_url = COALESCE(EXCLUDED.discord_url, tokens.discord_url),
+        collection_id = COALESCE(EXCLUDED.collection_id, tokens.collection_id),
         updated_at = NOW()
       RETURNING *
     `;
@@ -942,6 +1042,193 @@ app.post('/tokens', async (c) => {
     return c.json(newToken);
   } catch (e: any) {
     console.error('Error registering token:', e.message);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
+// ============================================
+// COLLECTIONS API ENDPOINTS
+// ============================================
+
+// GET /collections - List all collections with token count and total rewards
+app.get('/collections', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured', collections: [] }, 500);
+  }
+  
+  try {
+    const chainFilter = c.req.query('chain');
+    
+    let collections;
+    if (chainFilter) {
+      const chainId = chainFilter === 'ethereum' || chainFilter === '1' ? 1 : 8453;
+      collections = await sql`
+        SELECT 
+          c.*,
+          COUNT(t.id) as token_count,
+          COALESCE(SUM(
+            CASE WHEN t.address IS NOT NULL THEN 1 ELSE 0 END
+          ), 0) as linked_tokens
+        FROM collections c
+        LEFT JOIN tokens t ON t.collection_id = c.id
+        WHERE c.chain_id = ${chainId}
+        GROUP BY c.id
+        ORDER BY c.added_at DESC
+      `;
+    } else {
+      collections = await sql`
+        SELECT 
+          c.*,
+          COUNT(t.id) as token_count,
+          COALESCE(SUM(
+            CASE WHEN t.address IS NOT NULL THEN 1 ELSE 0 END
+          ), 0) as linked_tokens
+        FROM collections c
+        LEFT JOIN tokens t ON t.collection_id = c.id
+        GROUP BY c.id
+        ORDER BY c.added_at DESC
+      `;
+    }
+    
+    // Add total rewards from cache for each collection
+    const collectionsWithRewards = collections.map((col: any) => {
+      let totalRewards = 0;
+      
+      // Sum rewards from all linked tokens
+      for (const [key, data] of rewardsCache.entries()) {
+        const [chain, address] = key.split(':');
+        const chainId = chain === 'ethereum' ? 1 : 8453;
+        if (chainId === col.chain_id) {
+          // Check if this token belongs to this collection
+          const tokenRewards = parseFloat(data.totalRewards || '0');
+          totalRewards += tokenRewards;
+        }
+      }
+      
+      return {
+        id: col.id,
+        address: col.address,
+        chainId: col.chain_id,
+        name: col.name,
+        imageUrl: col.image_url,
+        description: col.description,
+        isCc0: col.is_cc0,
+        floorPriceEth: col.floor_price_eth ? parseFloat(col.floor_price_eth) : null,
+        totalSupply: col.total_supply,
+        holderCount: col.holder_count,
+        tokenCount: parseInt(col.token_count || '0'),
+        totalRewardsEth: totalRewards,
+        addedAt: col.added_at,
+        updatedAt: col.updated_at,
+      };
+    });
+    
+    return c.json({
+      collections: collectionsWithRewards,
+      count: collectionsWithRewards.length,
+      filter: chainFilter || null,
+    });
+  } catch (e: any) {
+    console.error('Error fetching collections:', e.message);
+    return c.json({ error: e.message, collections: [] }, 500);
+  }
+});
+
+// GET /collections/:address - Single collection with linked tokens
+app.get('/collections/:address', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  try {
+    const address = c.req.param('address').toLowerCase();
+    const chainParam = c.req.query('chain');
+    const chainId = chainParam === 'ethereum' || chainParam === '1' ? 1 : 
+                    chainParam === 'base' || chainParam === '8453' ? 8453 : null;
+    
+    let collection;
+    if (chainId) {
+      [collection] = await sql`
+        SELECT * FROM collections 
+        WHERE LOWER(address) = ${address} AND chain_id = ${chainId}
+      `;
+    } else {
+      // If no chain specified, get the first match
+      [collection] = await sql`
+        SELECT * FROM collections 
+        WHERE LOWER(address) = ${address}
+        LIMIT 1
+      `;
+    }
+    
+    if (!collection) {
+      return c.json({ error: 'Collection not found' }, 404);
+    }
+    
+    // Get linked tokens
+    const tokens = await sql`
+      SELECT * FROM tokens 
+      WHERE collection_id = ${collection.id}
+      ORDER BY deployed_at DESC
+    `;
+    
+    // Add market/rewards data from cache
+    const tokensWithData = tokens.map((token: any) => {
+      const cacheKey = `${token.chain}:${token.address.toLowerCase()}`;
+      const market = marketCache.get(cacheKey);
+      const rewards = rewardsCache.get(cacheKey);
+      
+      return {
+        address: token.address,
+        chain: token.chain,
+        name: token.name,
+        symbol: token.symbol,
+        imageUrl: token.image_url,
+        deployedAt: token.deployed_at,
+        deployer: token.deployer,
+        isVerified: token.is_verified || false,
+        market: market ? {
+          priceUsd: market.priceUsd,
+          priceChange24h: market.priceChange24h,
+          volume24h: market.volume24h,
+          marketCap: market.marketCap,
+          fdv: market.fdv,
+          liquidity: market.liquidity,
+        } : null,
+        rewards: rewards ? {
+          totalRewards: rewards.totalRewards,
+          accRewardPerNFT: rewards.accRewardPerNFT,
+          nftSupply: rewards.nftSupply,
+        } : null,
+      };
+    });
+    
+    // Calculate total rewards for collection
+    const totalRewardsEth = tokensWithData.reduce((sum: number, t: any) => {
+      return sum + (t.rewards ? parseFloat(t.rewards.totalRewards || '0') : 0);
+    }, 0);
+    
+    return c.json({
+      collection: {
+        id: collection.id,
+        address: collection.address,
+        chainId: collection.chain_id,
+        name: collection.name,
+        imageUrl: collection.image_url,
+        description: collection.description,
+        isCc0: collection.is_cc0,
+        floorPriceEth: collection.floor_price_eth ? parseFloat(collection.floor_price_eth) : null,
+        totalSupply: collection.total_supply,
+        holderCount: collection.holder_count,
+        totalRewardsEth,
+        addedAt: collection.added_at,
+        updatedAt: collection.updated_at,
+      },
+      tokens: tokensWithData,
+      tokenCount: tokensWithData.length,
+    });
+  } catch (e: any) {
+    console.error('Error fetching collection:', e.message);
     return c.json({ error: e.message }, 500);
   }
 });
@@ -1033,9 +1320,9 @@ app.get('/cache/all', async (c) => {
     // Get tokens from DB
     let tokens;
     if (chainFilter && validateChain(chainFilter)) {
-      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified FROM tokens WHERE chain = ${chainFilter} ORDER BY deployed_at DESC`;
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified, collection_id FROM tokens WHERE chain = ${chainFilter} ORDER BY deployed_at DESC`;
     } else {
-      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified FROM tokens ORDER BY deployed_at DESC`;
+      tokens = await sql`SELECT address, chain, name, symbol, nft_collection, image_url, deployed_at, website_url, twitter_url, telegram_url, discord_url, deployer, is_verified, collection_id FROM tokens ORDER BY deployed_at DESC`;
     }
     
     // Combine with cache data
@@ -1058,6 +1345,7 @@ app.get('/cache/all', async (c) => {
         discordUrl: token.discord_url,
         deployer: token.deployer,
         isVerified: token.is_verified || false,
+        collectionId: token.collection_id || null,
         market: market ? {
           priceUsd: market.priceUsd,
           priceChange24h: market.priceChange24h,
@@ -1122,6 +1410,7 @@ app.get('/cache/token/:address', async (c) => {
         discordUrl: token.discord_url,
         deployer: token.deployer,
         isVerified: token.is_verified || false,
+        collectionId: token.collection_id || null,
       },
       market: market || null,
       rewards: rewards || null,
