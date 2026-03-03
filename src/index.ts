@@ -236,16 +236,17 @@ async function runMigrations() {
     await sql`CREATE INDEX IF NOT EXISTS idx_tokens_collection ON tokens(collection_id)`;
     console.log('✅ tokens.collection_id column ready');
     
-    // Seed initial collections
+    // Seed initial collections with total_supply
     await sql`
-      INSERT INTO collections (address, chain_id, name, image_url, is_cc0)
+      INSERT INTO collections (address, chain_id, name, image_url, is_cc0, total_supply)
       VALUES 
-        ('0x79fcdef22feed20eddacbb2587640e45491b757f', 1, 'mfers', 'https://i.seadn.io/gae/J2iIgy5_gmA8IS6sXGKGZeFVZwhldQylk7w7fLepTE9S7ICPCn_dlo8kypX8Ja8O_bvnKR6hFtZsYCiCdEb_9Rzy-tT4UDGQTBUq?w=500', true),
-        ('0x0cc1cf477d41d864854074c2bde160dc88d17160', 1, 'mferdickbutts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true),
-        ('0x5c5d3cbaf7a3419af8e6661486b2d5ec3accfb1b', 8453, 'Based MferDickButts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true)
+        ('0x79fcdef22feed20eddacbb2587640e45491b757f', 1, 'mfers', 'https://i.seadn.io/gae/J2iIgy5_gmA8IS6sXGKGZeFVZwhldQylk7w7fLepTE9S7ICPCn_dlo8kypX8Ja8O_bvnKR6hFtZsYCiCdEb_9Rzy-tT4UDGQTBUq?w=500', true, 10021),
+        ('0x0cc1cf477d41d864854074c2bde160dc88d17160', 1, 'mferdickbutts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true, 5000),
+        ('0x5c5d3cbaf7a3419af8e6661486b2d5ec3accfb1b', 8453, 'Based MferDickButts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true, 3333)
       ON CONFLICT (address, chain_id) DO UPDATE SET
         name = EXCLUDED.name,
         image_url = EXCLUDED.image_url,
+        total_supply = EXCLUDED.total_supply,
         updated_at = NOW()
     `;
     console.log('✅ Initial collections seeded');
