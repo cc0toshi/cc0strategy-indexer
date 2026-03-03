@@ -1114,16 +1114,24 @@ app.get('/collections', async (c) => {
       `;
     }
     
-    // Add total rewards from cache for each collection
+    // First, get all tokens to build a lookup by collection_id
+    const allTokens = await sql`SELECT address, chain, collection_id, nft_collection FROM tokens`;
+    
+    // Add total rewards from cache for each collection (only for linked tokens)
     const collectionsWithRewards = collections.map((col: any) => {
       let totalRewards = 0;
       
-      // Sum rewards from all linked tokens
-      for (const [key, data] of rewardsCache.entries()) {
-        const [chain, address] = key.split(':');
-        const chainId = chain === 'ethereum' ? 1 : 8453;
-        if (chainId === col.chain_id) {
-          // Check if this token belongs to this collection
+      // Find all tokens linked to this collection
+      const linkedTokens = allTokens.filter((t: any) => 
+        t.collection_id === col.id || 
+        (t.nft_collection && t.nft_collection.toLowerCase() === col.address.toLowerCase())
+      );
+      
+      // Sum rewards only for tokens linked to this collection
+      for (const token of linkedTokens) {
+        const cacheKey = `${token.chain}:${token.address.toLowerCase()}`;
+        const data = rewardsCache.get(cacheKey);
+        if (data) {
           const tokenRewards = parseFloat(data.totalRewards || '0');
           totalRewards += tokenRewards;
         }
