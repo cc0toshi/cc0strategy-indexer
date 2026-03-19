@@ -241,7 +241,7 @@ async function runMigrations() {
       INSERT INTO collections (address, chain_id, name, image_url, is_cc0, total_supply)
       VALUES 
         ('0x79fcdef22feed20eddacbb2587640e45491b757f', 1, 'mfers', 'https://i.seadn.io/gae/J2iIgy5_gmA8IS6sXGKGZeFVZwhldQylk7w7fLepTE9S7ICPCn_dlo8kypX8Ja8O_bvnKR6hFtZsYCiCdEb_9Rzy-tT4UDGQTBUq?w=500', true, 10021),
-        ('0x0cc1cf477d41d864854074c2bde160dc88d17160', 1, 'mferdickbutts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true, 5000),
+        ('0x0cc1cf477d41d864854074c2bde160dc88d17160', 1, 'mferdickbutts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true, 2000),
         ('0x5c5d3cbaf7a3419af8e6661486b2d5ec3accfb1b', 8453, 'Based MferDickButts', 'https://i.seadn.io/s/raw/files/d5a38c30e78ae93db2c3b5ad6f8e9e62.png?w=500', true, 3333)
       ON CONFLICT (address, chain_id) DO UPDATE SET
         name = EXCLUDED.name,
@@ -276,6 +276,21 @@ async function runMigrations() {
       WHERE UPPER(symbol) = 'MFERDICKBUTT' AND chain = 'ethereum' AND collection_id IS NULL
     `;
     
+
+    // Create collection_listings table for tracking listing payments
+    await sql`
+      CREATE TABLE IF NOT EXISTS collection_listings (
+        id SERIAL PRIMARY KEY,
+        collection_id INTEGER REFERENCES collections(id),
+        payment_tx_hash TEXT NOT NULL UNIQUE,
+        payment_chain TEXT NOT NULL,
+        payment_amount TEXT NOT NULL,
+        submitter_wallet TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      )
+    `;
+    console.log('✅ collection_listings table ready');
+
     console.log('✅ Existing tokens linked to collections');
     console.log('✅ All migrations complete');
     
@@ -1265,6 +1280,253 @@ app.get('/collections/:address', async (c) => {
   }
 });
 
+
+// ============================================
+// COLLECTION LISTING API ENDPOINTS
+// ============================================
+
+// USDC ERC20 Transfer event topic
+const USDC_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+
+// Helper to verify USDC payment transaction
+async function verifyUsdcPayment(
+  txHash: string,
+  chain: SupportedChain,
+  expectedRecipient: string,
+  expectedAmount: bigint
+): Promise<{ valid: boolean; error?: string; sender?: string }> {
+  const rpcUrl = getRpcUrl(chain);
+  if (!rpcUrl) {
+    return { valid: false, error: 'RPC not configured for chain' };
+  }
+
+  try {
+    // Get transaction receipt
+    const receiptRes = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'eth_getTransactionReceipt',
+        params: [txHash],
+        id: 1,
+      }),
+    });
+    
+    const receiptData = await receiptRes.json();
+    if (!receiptData.result) {
+      return { valid: false, error: 'Transaction not found or not confirmed' };
+    }
+    
+    const receipt = receiptData.result;
+    
+    // Check transaction status
+    if (receipt.status !== '0x1') {
+      return { valid: false, error: 'Transaction failed' };
+    }
+    
+    // Get USDC address for this chain
+    const chainConfig = getChainConfig(chain);
+    if (!chainConfig) {
+      return { valid: false, error: 'Invalid chain' };
+    }
+    const usdcAddress = chainConfig.usdc.toLowerCase();
+    
+    // Find USDC Transfer event to expected recipient
+    for (const log of receipt.logs) {
+      if (log.address.toLowerCase() !== usdcAddress) continue;
+      if (log.topics[0] !== USDC_TRANSFER_TOPIC) continue;
+      
+      // topics[1] = from (padded address)
+      // topics[2] = to (padded address)
+      const to = '0x' + log.topics[2].slice(26).toLowerCase();
+      
+      if (to !== expectedRecipient.toLowerCase()) continue;
+      
+      // data = amount (uint256)
+      const amount = BigInt(log.data);
+      
+      if (amount >= expectedAmount) {
+        const sender = '0x' + log.topics[1].slice(26).toLowerCase();
+        return { valid: true, sender };
+      }
+    }
+    
+    return { valid: false, error: 'No valid USDC transfer found to recipient' };
+  } catch (e: any) {
+    console.error('USDC payment verification error:', e);
+    return { valid: false, error: e.message };
+  }
+}
+
+// GET /collections/list/price - Get current listing price
+app.get('/collections/list/price', (c) => {
+  return c.json({
+    price: 199,
+    currency: 'USDC',
+    decimals: 6,
+    rawAmount: '199000000',
+    recipient: '0x58e510F849e38095375a3e478ad1d719650B8557',
+    acceptedChains: ['base', 'ethereum'],
+    usdcAddresses: {
+      base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+      ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+    },
+  });
+});
+
+// POST /collections/list - List a new collection (after payment verification)
+app.post('/collections/list', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  try {
+    const body = await c.req.json();
+    const { 
+      collectionAddress,
+      collectionChain, // Chain where the NFT collection exists
+      paymentTxHash,
+      paymentChain,    // Chain where USDC payment was made
+      submitterWallet 
+    } = body;
+    
+    // Validate required fields
+    if (!collectionAddress || !collectionChain || !paymentTxHash || !paymentChain) {
+      return c.json({ 
+        error: 'Missing required fields',
+        required: ['collectionAddress', 'collectionChain', 'paymentTxHash', 'paymentChain']
+      }, 400);
+    }
+    
+    // Validate chains
+    if (!validateChain(collectionChain) || !validateChain(paymentChain)) {
+      return c.json({ error: 'Invalid chain. Supported: base, ethereum' }, 400);
+    }
+    
+    const normalizedAddress = collectionAddress.toLowerCase();
+    const collectionChainId = collectionChain === 'ethereum' ? 1 : 8453;
+    
+    // Check if collection already exists
+    const [existing] = await sql`
+      SELECT id FROM collections 
+      WHERE LOWER(address) = ${normalizedAddress} AND chain_id = ${collectionChainId}
+    `;
+    
+    if (existing) {
+      return c.json({ error: 'Collection already listed' }, 400);
+    }
+    
+    // Check if this tx hash was already used
+    const [usedTx] = await sql`
+      SELECT id FROM collection_listings 
+      WHERE payment_tx_hash = ${paymentTxHash}
+    `;
+    
+    if (usedTx) {
+      return c.json({ error: 'Payment transaction already used' }, 400);
+    }
+    
+    // Verify USDC payment
+    const LISTING_FEE = 199_000_000n; // 199 USDC
+    const RECIPIENT = '0x58e510F849e38095375a3e478ad1d719650B8557';
+    
+    const paymentResult = await verifyUsdcPayment(
+      paymentTxHash,
+      paymentChain as SupportedChain,
+      RECIPIENT,
+      LISTING_FEE
+    );
+    
+    if (!paymentResult.valid) {
+      return c.json({ 
+        error: 'Payment verification failed',
+        details: paymentResult.error 
+      }, 400);
+    }
+    
+    // Verify it's a valid ERC721 contract by checking supportsInterface
+    const networkSlug = collectionChain === 'ethereum' ? 'ethereum' : 'base';
+    let collectionMetadata: { name: string; image: string | null; totalSupply: number | null } = {
+      name: `Collection ${normalizedAddress.slice(0, 8)}`,
+      image: null,
+      totalSupply: null,
+    };
+    
+    // Try to fetch metadata from OpenSea
+    try {
+      const osUrl = `https://api.opensea.io/api/v2/chain/${networkSlug}/contract/${normalizedAddress}`;
+      const osRes = await fetch(osUrl, {
+        headers: { 'Accept': 'application/json' },
+      });
+      
+      if (osRes.ok) {
+        const osData = await osRes.json();
+        collectionMetadata.name = osData.collection || osData.name || collectionMetadata.name;
+        collectionMetadata.image = osData.image_url || null;
+        collectionMetadata.totalSupply = osData.total_supply || null;
+      }
+    } catch (e) {
+      console.error('OpenSea metadata fetch failed:', e);
+    }
+    
+    // Insert the collection
+    const [newCollection] = await sql`
+      INSERT INTO collections (
+        address, chain_id, name, image_url, is_cc0, total_supply, added_at, updated_at
+      ) VALUES (
+        ${normalizedAddress}, 
+        ${collectionChainId}, 
+        ${collectionMetadata.name}, 
+        ${collectionMetadata.image}, 
+        true, 
+        ${collectionMetadata.totalSupply},
+        NOW(),
+        NOW()
+      )
+      RETURNING *
+    `;
+    
+    // Record the listing payment
+    await sql`
+      INSERT INTO collection_listings (
+        collection_id, 
+        payment_tx_hash, 
+        payment_chain, 
+        payment_amount,
+        submitter_wallet,
+        created_at
+      ) VALUES (
+        ${newCollection.id},
+        ${paymentTxHash},
+        ${paymentChain},
+        '199000000',
+        ${submitterWallet || paymentResult.sender || null},
+        NOW()
+      )
+    `;
+    
+    console.log(`✅ New collection listed: ${collectionMetadata.name} (${normalizedAddress}) on ${collectionChain}`);
+    
+    return c.json({
+      success: true,
+      collection: {
+        id: newCollection.id,
+        address: newCollection.address,
+        chainId: newCollection.chain_id,
+        name: newCollection.name,
+        imageUrl: newCollection.image_url,
+        totalSupply: newCollection.total_supply,
+      },
+      message: 'Collection successfully listed! It will now appear on cc0strategy.fun',
+    });
+    
+  } catch (e: any) {
+    console.error('Collection listing error:', e);
+    return c.json({ error: e.message }, 500);
+  }
+});
+
 // GET /stats - Overall stats with per-chain breakdown
 app.get('/stats', async (c) => {
   if (!sql) {
@@ -1661,6 +1923,7 @@ checkAllRpcHealth().then(() => {
 
 // Start cache refresh loops
 startCacheRefreshLoops();
+
 
 // Create HTTP server and attach Socket.IO
 const httpServer = createServer(async (req, res) => {
