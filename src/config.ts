@@ -25,7 +25,23 @@ export interface ChainConfig {
   positionManager: string;
   permit2: string;
   weth: string;
+  
+  // Stablecoins
+  usdc: string;
 }
+
+// USDC addresses (Circle native)
+export const USDC_ADDRESSES = {
+  base: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+  ethereum: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
+} as const;
+
+// Collection listing fee in USDC (6 decimals)
+export const LISTING_FEE_USDC = 199_000_000n; // 199 USDC
+export const LISTING_FEE_DISPLAY = 199; // For display
+
+// Payment recipient wallet (bankr)
+export const PAYMENT_RECIPIENT = '0x58e510F849e38095375a3e478ad1d719650B8557';
 
 export const CHAIN_CONFIGS: Record<SupportedChain, ChainConfig> = {
   base: {
@@ -46,6 +62,7 @@ export const CHAIN_CONFIGS: Record<SupportedChain, ChainConfig> = {
     positionManager: '0x7C5f5A4bBd8fD63184577525326123B519429bDc',
     permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
     weth: '0x4200000000000000000000000000000000000006',
+    usdc: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
   },
   
   ethereum: {
@@ -54,38 +71,31 @@ export const CHAIN_CONFIGS: Record<SupportedChain, ChainConfig> = {
     rpcEnvKey: 'ETH_RPC_URL',
     
     // cc0strategy contracts (REDEPLOYED 2026-02-24 v2 - fully configured)
-    // 
     factory: '0x1dc68bc05ecb132059fb45b281dbfa92b6fab610',
     hook: '0xEfd2F889eD9d7A2Bf6B6C9c2b20c5AEb6EBEe8Cc',
     feeDistributor: '0xdcfb59f2d41c58a1325b270c2f402c1884338d0d',
     lpLocker: '0x05492c0091e49374e71c93e74739d3f650b59077',
-    treasury: '0x58e510f849e38095375a3e478ad1d719650b8557', // Same as Base
+    treasury: '0x58e510f849e38095375a3e478ad1d719650b8557',
     
-    // Uniswap V4 contracts (ready for deployment)
+    // Uniswap V4 contracts
     poolManager: '0x000000000004444c5dc75cB358380D2e3dE08A90',
     universalRouter: '0x66a9893cC07D91D95644AEDD05D03f95e1dba8Af',
     positionManager: '0xbd216513d74c8cf14cf4747e6aaa6420ff64ee9e',
     permit2: '0x000000000022D473030F116dDEE9F6B43aC78BA3',
     weth: '0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2',
+    usdc: '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48',
   },
 };
 
 /**
  * Events to index (for future event indexing)
- * 
- * Factory Events:
- * - TokenDeployed(address indexed token, address indexed nftCollection, address deployer)
- * 
- * FeeDistributor Events:
- * - FeesReceived(address indexed token, uint256 amount)
- * - FeesClaimed(address indexed token, address indexed claimer, uint256[] tokenIds, uint256 amount)
  */
 export const INDEXED_EVENTS = {
   factory: [
     {
       name: 'TokenDeployed',
       signature: 'TokenDeployed(address,address,address)',
-      topic: '0x...', // To be filled with actual topic hash
+      topic: '0x...',
     },
   ],
   feeDistributor: [
