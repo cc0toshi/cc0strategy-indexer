@@ -1388,7 +1388,11 @@ app.post('/collections/list', async (c) => {
       collectionChain, // Chain where the NFT collection exists
       paymentTxHash,
       paymentChain,    // Chain where USDC payment was made
-      submitterWallet 
+      submitterWallet,
+      // Optional metadata from frontend (pre-fetched from OpenSea)
+      name: passedName,
+      imageUrl: passedImageUrl,
+      totalSupply: passedTotalSupply,
     } = body;
     
     // Validate required fields
@@ -1445,29 +1449,30 @@ app.post('/collections/list', async (c) => {
       }, 400);
     }
     
-    // Verify it's a valid ERC721 contract by checking supportsInterface
-    const networkSlug = collectionChain === 'ethereum' ? 'ethereum' : 'base';
+    // Use metadata from frontend if provided, otherwise try OpenSea
     let collectionMetadata: { name: string; image: string | null; totalSupply: number | null } = {
-      name: `Collection ${normalizedAddress.slice(0, 8)}`,
-      image: null,
-      totalSupply: null,
+      name: passedName || `Collection ${normalizedAddress.slice(0, 8)}`,
+      image: passedImageUrl || null,
+      totalSupply: passedTotalSupply || null,
     };
     
-    // Try to fetch metadata from OpenSea
-    try {
-      const osUrl = `https://api.opensea.io/api/v2/chain/${networkSlug}/contract/${normalizedAddress}`;
-      const osRes = await fetch(osUrl, {
-        headers: { 'Accept': 'application/json' },
-      });
-      
-      if (osRes.ok) {
-        const osData = await osRes.json();
-        collectionMetadata.name = osData.collection || osData.name || collectionMetadata.name;
-        collectionMetadata.image = osData.image_url || null;
-        collectionMetadata.totalSupply = osData.total_supply || null;
+    // Only fetch from OpenSea if metadata wasn't provided
+    if (!passedName && !passedImageUrl) {
+      const networkSlug = collectionChain === 'ethereum' ? 'ethereum' : 'base';
+      try {
+        const osUrl = `https://api.opensea.io/api/v2/chain/${networkSlug}/contract/${normalizedAddress}`;
+        const osRes = await fetch(osUrl, {
+          headers: { 'Accept': 'application/json' },
+        });
+        
+        if (osRes.ok) {
+          const osData = await osRes.json();
+          collectionMetadata.name = osData.collection || osData.name || collectionMetadata.name;
+          // Note: contract endpoint doesn't return image_url or total_supply
+        }
+      } catch (e) {
+        console.error('OpenSea metadata fetch failed:', e);
       }
-    } catch (e) {
-      console.error('OpenSea metadata fetch failed:', e);
     }
     
     // Insert the collection
