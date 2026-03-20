@@ -1181,6 +1181,49 @@ app.get('/collections', async (c) => {
   }
 });
 
+// GET /collections/exists - Check if a collection is already listed (pre-payment check)
+app.get('/collections/exists', async (c) => {
+  if (!sql) {
+    return c.json({ error: 'Database not configured' }, 500);
+  }
+  
+  const address = c.req.query('address');
+  const chainId = c.req.query('chainId');
+  
+  if (!address || !chainId) {
+    return c.json({ error: 'Missing address or chainId' }, 400);
+  }
+  
+  const normalizedAddress = address.toLowerCase();
+  const chainIdNum = parseInt(chainId);
+  
+  try {
+    const [existing] = await sql`
+      SELECT id, name, image_url, address, chain_id 
+      FROM collections 
+      WHERE LOWER(address) = ${normalizedAddress} AND chain_id = ${chainIdNum}
+    `;
+    
+    if (existing) {
+      return c.json({ 
+        exists: true,
+        collection: {
+          id: existing.id,
+          name: existing.name,
+          imageUrl: existing.image_url,
+          address: existing.address,
+          chainId: existing.chain_id,
+        }
+      });
+    }
+    
+    return c.json({ exists: false });
+  } catch (e) {
+    console.error('Collection exists check error:', e);
+    return c.json({ error: 'Database error' }, 500);
+  }
+});
+
 // GET /collections/:address - Single collection with linked tokens
 app.get('/collections/:address', async (c) => {
   if (!sql) {
@@ -1358,49 +1401,6 @@ async function verifyUsdcPayment(
     return { valid: false, error: e.message };
   }
 }
-
-// GET /collections/exists - Check if a collection is already listed (pre-payment check)
-app.get('/collections/exists', async (c) => {
-  if (!sql) {
-    return c.json({ error: 'Database not configured' }, 500);
-  }
-  
-  const address = c.req.query('address');
-  const chainId = c.req.query('chainId');
-  
-  if (!address || !chainId) {
-    return c.json({ error: 'Missing address or chainId' }, 400);
-  }
-  
-  const normalizedAddress = address.toLowerCase();
-  const chainIdNum = parseInt(chainId);
-  
-  try {
-    const [existing] = await sql`
-      SELECT id, name, image_url, address, chain_id 
-      FROM collections 
-      WHERE LOWER(address) = ${normalizedAddress} AND chain_id = ${chainIdNum}
-    `;
-    
-    if (existing) {
-      return c.json({ 
-        exists: true,
-        collection: {
-          id: existing.id,
-          name: existing.name,
-          imageUrl: existing.image_url,
-          address: existing.address,
-          chainId: existing.chain_id,
-        }
-      });
-    }
-    
-    return c.json({ exists: false });
-  } catch (e) {
-    console.error('Collection exists check error:', e);
-    return c.json({ error: 'Database error' }, 500);
-  }
-});
 
 // GET /collections/list/price - Get current listing price
 app.get('/collections/list/price', (c) => {
