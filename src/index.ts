@@ -1362,10 +1362,10 @@ async function verifyUsdcPayment(
 // GET /collections/list/price - Get current listing price
 app.get('/collections/list/price', (c) => {
   return c.json({
-    price: 199,
+    price: 0.01, // TESTING
     currency: 'USDC',
     decimals: 6,
-    rawAmount: '199000000',
+    rawAmount: '10000', // TESTING
     recipient: '0x58e510F849e38095375a3e478ad1d719650B8557',
     acceptedChains: ['base', 'ethereum'],
     usdcAddresses: {
@@ -1428,7 +1428,7 @@ app.post('/collections/list', async (c) => {
     }
     
     // Verify USDC payment
-    const LISTING_FEE = 199_000_000n; // 199 USDC
+    const LISTING_FEE = 10_000n; // 0.01 USDC (TESTING)
     const RECIPIENT = '0x58e510F849e38095375a3e478ad1d719650B8557';
     
     const paymentResult = await verifyUsdcPayment(
